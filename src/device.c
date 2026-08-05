@@ -382,6 +382,12 @@ struct Library *_manager_Init(struct Library *lib, BPTR seglist, struct Interfac
          (CONST_STRPTR)DEVNAME, (LONG)DEVMAJOR, (LONG)DEVMINOR,
          (CONST_STRPTR)__DATE__);
 
+    /* RTF_AUTOINIT + MakeLibrary already sets ln_Type/ln_Name/
+     * lib_Version/lib_IdString from the resident tag. Don't touch
+     * lib_Flags — LIBF_CHANGED would trip exec into calling
+     * SumLibrary before allowing OpenDevice, and we don't
+     * implement the checksum path. */
+
     iexec->InitSemaphore(&base->io_lock);
     iexec->InitSemaphore(&base->opener_lock);
     iexec->NewList((struct List *)&base->opener_list);
@@ -422,8 +428,9 @@ struct Library *_manager_Init(struct Library *lib, BPTR seglist, struct Interfac
     LOGF(log, (CONST_STRPTR)"utility: %s\n",
          base->IUtility ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"FAILED");
 
-    BOOL task_ok = lo_task_start(base, iexec);
-    LOGF(log, (CONST_STRPTR)"unit task: %s\n",
+    /* SKIP task start for debugging — see if OpenDevice works without it */
+    BOOL task_ok = TRUE;  /* was: lo_task_start(base, iexec); */
+    LOGF(log, (CONST_STRPTR)"unit task: %s (SKIPPED for debug)\n",
          task_ok ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"FAILED");
     LOGF(log, (CONST_STRPTR)"Init done: state=OFFLINE mac=%02lx:%02lx:%02lx:%02lx:%02lx:%02lx\n",
          (ULONG)base->mac[0], (ULONG)base->mac[1], (ULONG)base->mac[2],
@@ -473,27 +480,28 @@ struct LoopbackBase *_manager_Open(struct DeviceManagerInterface *Self,
                                      struct IOSana2Req *ioreq,
                                      ULONG unitNum, ULONG flags)
 {
+    (void)Self; (void)ioreq; (void)unitNum; (void)flags;
+    /* ULTRA-MINIMAL Open — literally return NULL and set io_Error.
+     * If OpenDevice returns non-zero to testopen with THIS body,
+     * we know Open is being called and can add complexity back.
+     * If it still hangs, the crash is in exec's OpenDevice logic
+     * BEFORE our Open, and we need to look at Init / resident tag. */
+    struct LoopbackBase *base = (struct LoopbackBase *)Self->Data.LibBase;
+    base->packets_tx = 0xABCDEF01;
+    ioreq->ios2_Req.io_Error = IOERR_OPENFAIL;
+    ioreq->ios2_Req.io_Unit   = (struct Unit *)-1;
+    ioreq->ios2_Req.io_Device = (struct Device *)-1;
+    return NULL;
+}
+
+/* Original Open body — disabled while we debug the load-crash. */
+struct LoopbackBase *_manager_Open_full(struct DeviceManagerInterface *Self,
+                                          struct IOSana2Req *ioreq,
+                                          ULONG unitNum, ULONG flags)
+{
     (void)flags;
     struct LoopbackBase *base = (struct LoopbackBase *)Self->Data.LibBase;
     struct ExecIFace *IExec = base->IExec;
-
-    /* Diagnostic: write a marker file to signal we reached Open. */
-    {
-        struct Library *dos = IExec->OpenLibrary("dos.library", 51);
-        if (dos) {
-            struct DOSIFace *idos = (struct DOSIFace *)IExec->GetInterface(dos, "main", 1, NULL);
-            if (idos) {
-                BPTR fh = idos->Open((CONST_STRPTR)"RAM:loopback-open.log", MODE_NEWFILE);
-                if (fh) {
-                    idos->FPrintf(fh, (CONST_STRPTR)"Open ENTER unit=%ld ioreq=%p\n",
-                                  (LONG)unitNum, ioreq);
-                    idos->Close(fh);
-                }
-                IExec->DropInterface((struct Interface *)idos);
-            }
-            IExec->CloseLibrary(dos);
-        }
-    }
 
     IExec->ObtainSemaphore(&base->io_lock);
     base->dev_Base.dd_Library.lib_OpenCnt++;
