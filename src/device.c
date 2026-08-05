@@ -1,98 +1,83 @@
 /*
- * loopback.device — pure-software SANA-II loopback for AmigaOS 4.
+ * virtnet.device — SANA-II network device driver for the virtio-net paravirtual NIC
+ * (82540EM) as emulated by QEMU on the sam460ex AmigaOS 4.1 PPC target.
  *
- * Every CMD_WRITE is delivered as an RX on the same interface in
- * the same unit-task iteration. No PCI, no MMIO, no DMA, no QEMU
- * roundtrip. Diagnostic instrument: bind Roadshow to this and run
- * an in-guest iperf3 client + server over it to measure the ceiling
- * of Roadshow + bsdsocket + SANA-II with zero hardware overhead.
+ * PHASE 1 — SKELETON ONLY.
  *
- * The resident-tag / manager-interface boilerplate is copied verbatim
- * from `virtnet.device`, which itself follows the OS4 driver skeleton
- * proven by VirtualSCSIDevice and Bill Borsari's virte1000. The
- * loopback-specific logic is confined to `lo_deliver()` and the
- * dispatch switch in `lo_dispatch_ioreq()`.
+ * This build produces a valid loadable OS4 device with a resident tag,
+ * Init/Open/Close/Expunge, and a BeginIO that always replies IOERR_NOCMD.
+ * No PCI enumeration, no descriptor rings, no SANA-II command dispatch,
+ * no unit tasks. Purpose: prove the docker → push → OpenDevice loop.
+ *
+ * Shape borrowed from derfsss/VirtualSCSIDevice — most of the hard-won
+ * OS4 device-driver conventions (resident-in-.data, 68k jump table,
+ * DeviceManagerInterface vector layout, RTF_AUTOINIT semantics) come
+ * from studying that project. See docs/DESIGN.md for the register-level
+ * design; this file is deliberately minimal.
  */
 
 #include "loopback.h"
+#include "virtio.h"
 #include "version.h"
 
 #include <exec/exectags.h>
-#include <exec/errors.h>
 #include <exec/interfaces.h>
 #include <exec/resident.h>
+#include <exec/errors.h>
 #include <exec/execbase.h>
-#include <devices/newstyle.h>
+#include <exec/emulation.h>       /* ET_RegisterA0/A1/D0 for EmulateTags */
+
+#include <devices/newstyle.h>   /* NSCMD_DEVICEQUERY + NSDeviceQueryResult */
+
+#include <dos/dos.h>
 #include <interfaces/dos.h>
 
+#include <exec/ports.h>    /* PA_IGNORE, MsgPort init */
+
 #include <stdarg.h>
-#include <stddef.h>
+#include <stddef.h>   /* offsetof - S2_DEVICEQUERY field-fits gates */
 
-/* ---------- Debug logging (RAM: file) ---------- */
+/* Status-file path. Init appends one line per attempt; each line begins
+ * with a monotonic tag so tests can grep for a specific run. Writing to
+ * a file rather than DebugPrintF because DebugPrintF on the QEMU sam460ex
+ * target isn't wired to the kernel serial channel and disappears; a file
+ * we can read back via devbench's /api/file endpoint. */
+#define VIRTNET_STATUS_FILE  "RAM:loopback-init.log"
+#define VIRTNET_TRACE_FILE   "RAM:virtnet-trace.log"
 
-#define LOOPBACK_STATUS_FILE  "RAM:loopback-init.log"
-
-struct LoLogCtx {
-    struct Library     *DOSBase;
-    struct DOSIFace    *IDOS;
-    BPTR                fh;
-};
-
-static void lo_log_open(struct ExecIFace *IExec, struct LoLogCtx *ctx)
+/* Phase 8c: lazy trace-log opener. dos.library isn't reliably available
+ * at _manager_Init boot-time (Init runs early); attempt to open on
+ * first BeginIO instead. Safe to no-op if open fails — caller checks
+ * base->trace_fh before write. */
+static void vn_trace_open(struct LoopbackBase *base)
 {
-    ctx->DOSBase = NULL; ctx->IDOS = NULL; ctx->fh = (BPTR)NULL;
-    ctx->DOSBase = IExec->OpenLibrary("dos.library", 51);
-    if (!ctx->DOSBase) return;
-    ctx->IDOS = (struct DOSIFace *)IExec->GetInterface(ctx->DOSBase, "main", 1, NULL);
-    if (!ctx->IDOS) { IExec->CloseLibrary(ctx->DOSBase); ctx->DOSBase = NULL; return; }
-    ctx->fh = ctx->IDOS->Open((CONST_STRPTR)LOOPBACK_STATUS_FILE, MODE_NEWFILE);
+    if (base->trace_fh) return;   /* already open */
+    if (!base->DOSBase) {
+        base->DOSBase = base->IExec->OpenLibrary("dos.library", 51);
+        if (!base->DOSBase) return;
+        base->IDOS = base->IExec->GetInterface(base->DOSBase, "main", 1, NULL);
+        if (!base->IDOS) {
+            base->IExec->CloseLibrary(base->DOSBase);
+            base->DOSBase = NULL;
+            return;
+        }
+    }
+    struct DOSIFace *IDOS = (struct DOSIFace *)base->IDOS;
+    base->trace_fh = IDOS->Open((CONST_STRPTR)VIRTNET_TRACE_FILE, MODE_NEWFILE);
 }
 
-static void lo_log_close(struct ExecIFace *IExec, struct LoLogCtx *ctx)
-{
-    if (ctx->fh) { ctx->IDOS->Close(ctx->fh); ctx->fh = (BPTR)NULL; }
-    if (ctx->IDOS) { IExec->DropInterface((struct Interface *)ctx->IDOS); ctx->IDOS = NULL; }
-    if (ctx->DOSBase) { IExec->CloseLibrary(ctx->DOSBase); ctx->DOSBase = NULL; }
-}
+/* Phase 8c revert: TRACEF was hanging when called from BeginIO fast-
+ * path post-crash — dos.library Open() may block if there's an issue
+ * with the DOS handle lifecycle across task deaths. Compiled out
+ * entirely. cmdlog ring in LoopbackBase already records every
+ * dispatch and is readable via DBG_CMDLOG through the BeginIO
+ * fast-path (added at the same time as this). */
+#define TRACEF(base, ...) do { (void)(base); } while (0)
 
-#define LOGF(ctx, ...) \
-    do { if ((ctx).fh) (ctx).IDOS->FPrintf((ctx).fh, __VA_ARGS__); } while (0)
-
-/* ---------- PPC time-base helper for profiling ---------- */
-
-static inline uint32 lo_tb(void)
-{
-    uint32 t;
-    __asm__ volatile ("mftb %0" : "=r"(t) : : "memory");
-    return t;
-}
-
-/* ---------- Standard NSD supported-command list ---------- */
-
-static const UWORD lo_supported_cmds[] = {
-    NSCMD_DEVICEQUERY,
-    CMD_READ,
-    CMD_WRITE,
-    S2_DEVICEQUERY,
-    S2_GETSTATIONADDRESS,
-    S2_CONFIGINTERFACE,
-    S2_ONLINE,
-    S2_OFFLINE,
-    S2_BROADCAST,
-    S2_READORPHAN,
-    S2_ADDMULTICASTADDRESS,
-    S2_DELMULTICASTADDRESS,
-    S2_ADDMULTICASTADDRESSES,
-    S2_DELMULTICASTADDRESSES,
-    S2_TRACKTYPE,
-    S2_UNTRACKTYPE,
-    S2_SANA2HOOK,
-    LO_DBG_STATUS,
-    0
-};
-
-/* ---------- Manager Obtain/Release ---------- */
-
+/*
+ * Manager Obtain/Release — reference counting on the interface itself.
+ * Standard OS4 idiom; every device driver's manager interface has this.
+ */
 uint32 _manager_Obtain(struct DeviceManagerInterface *Self)
 {
     Self->Data.RefCount++;
@@ -105,25 +90,27 @@ uint32 _manager_Release(struct DeviceManagerInterface *Self)
     return Self->Data.RefCount;
 }
 
-/* ---------- Forward decls for vectors ---------- */
-
-extern struct Library *_manager_Init(struct Library *lib, BPTR seglist, struct Interface *exec);
+/* Forward decls for the vector table. */
+extern struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Interface *exec);
 extern struct LoopbackBase *_manager_Open(struct DeviceManagerInterface *Self,
-                                            struct IOSana2Req *ioreq,
-                                            ULONG unitNum, ULONG flags);
+                                           struct IOSana2Req *ioreq,
+                                           ULONG unitNum, ULONG flags);
 extern BPTR _manager_Close(struct DeviceManagerInterface *Self, struct IOSana2Req *ioreq);
 extern BPTR _manager_Expunge(struct DeviceManagerInterface *Self);
 extern void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *ioreq);
 extern LONG _manager_AbortIO(struct DeviceManagerInterface *Self, struct IOSana2Req *ioreq);
 
+/* OS4 vector table for DeviceManagerInterface. Order and terminator are
+ * mandated by exec/interfaces.h — do not reorder. */
 static const APTR _manager_Vectors[] = {
     (APTR)_manager_Obtain,
     (APTR)_manager_Release,
-    (APTR)NULL, (APTR)NULL,
+    (APTR)NULL,             /* Expunge-slot on Interface — unused */
+    (APTR)NULL,             /* Clone — unused */
     (APTR)_manager_Open,
     (APTR)_manager_Close,
     (APTR)_manager_Expunge,
-    (APTR)NULL,
+    (APTR)NULL,             /* Reserved */
     (APTR)_manager_BeginIO,
     (APTR)_manager_AbortIO,
     (APTR)-1,
@@ -138,7 +125,13 @@ static const struct TagItem _manager_Tags[] = {
 
 const APTR devInterfaces[] = { (APTR)_manager_Tags, (APTR)NULL };
 
-/* 68k-compat jump table — same order as classic devices. */
+/*
+ * 68k-compat jump table. Not strictly required for a SANA-II device
+ * (stack callers are all OS4-native), but including it costs nothing
+ * and matches the pattern of every shipping OS4 .device — safer
+ * default. See VSD device.c for the incident that established the
+ * need for this on trackdisk-style drivers.
+ */
 static const APTR _manager_Vectors68K[] = {
     (APTR)_manager_Open,     /* -6  */
     (APTR)_manager_Close,    /* -12 */
@@ -149,8 +142,10 @@ static const APTR _manager_Vectors68K[] = {
     (APTR)-1,
 };
 
+/* Version cookie for the AmigaDOS `Version` command. */
 static const char verstag[] __attribute__((used)) = "\0$VER: " DEVVERSIONSTRING;
 
+/* Init tag list — CLT_DataSize tells the kernel how big our libBase is. */
 static struct TagItem dev_init_tags[] = {
     {CLT_DataSize,     sizeof(struct LoopbackBase)},
     {CLT_Interfaces,   (ULONG)devInterfaces},
@@ -160,160 +155,165 @@ static struct TagItem dev_init_tags[] = {
     {TAG_END,          0},
 };
 
+/*
+ * Resident struct — NOT const. Every working OS4 kickstart device places
+ * this in writable .data because the kernel/DOS may patch fields during
+ * boot binding. Putting it in .rodata is a footgun documented on the
+ * VirtualSCSIDevice side. Keep it here, keep it writable, done.
+ */
 static struct Resident dev_res __attribute__((used)) = {
     RTC_MATCHWORD,
     (struct Resident *)&dev_res,
     (struct Resident *)(&dev_res + 1),
     RTF_NATIVE | RTF_COLDSTART | RTF_AUTOINIT,
-    DEVMAJOR,
+    DEVVER,
     NT_DEVICE,
     0,
-    (STRPTR)DEVNAME,
-    (STRPTR)DEVVERSIONSTRING,
+    DEVNAME,
+    DEVVERSIONSTRING,
     (APTR)dev_init_tags,
 };
 
+/*
+ * Shell entry point. This file is not a runnable executable, but the
+ * linker still needs an _start. Print an explanatory line via
+ * DebugPrintF (no dos.library needed) and return failure.
+ */
 int _start(char *argstring, int arglen, struct ExecBase *sysbase)
 {
     (void)argstring; (void)arglen;
     struct ExecIFace *IExec = (struct ExecIFace *)sysbase->MainInterface;
-    IExec->DebugPrintF("%s is a device — install to DEVS:Networks/ or "
-                       "OpenDevice() from a test program.\n", DEVNAME);
-    return 20;
+    IExec->DebugPrintF("%s is a device — install to SYS:Kickstart/ or "
+                       "OpenDevice() from a test program. Cannot run from shell.\n",
+                       DEVNAME);
+    return 20; /* RETURN_FAIL */
 }
 
-/* ---------- Opener list + copy hook helpers ---------- */
+/* ------------------------------------------------------------------ */
+/* Init / Open / Close / Expunge / BeginIO / AbortIO — skeleton bodies */
+/* ------------------------------------------------------------------ */
 
-static struct LoOpener *lo_find_opener(struct LoopbackBase *base, APTR bm_cookie)
+/* virtio-net-pci device IDs. QEMU's -device virtio-net-pci is
+ * transitional — supports both legacy (0.9.5) and modern (1.0+)
+ * modes. Legacy device ID is 0x1000, modern is 0x1041. Target the
+ * legacy path first — simpler, no PCI capability walking, universally
+ * supported. Vendor 0x1AF4 = Red Hat (assigned to virtio). */
+#define VIRTIO_PCI_VENDOR            0x1AF4
+#define VIRTIO_NET_PCI_DEVICE        0x1000    /* legacy / transitional */
+#define VIRTIO_NET_PCI_DEVICE_MODERN 0x1041    /* modern-only (unused for now) */
+
+/* NSCMD_DEVICEQUERY supported-commands list. Standard NSD idiom
+ * (see daynaport-amiga/device.c for the pattern). OS4 exec MAY be
+ * pre-checking this list before dispatching CMD_WRITE / S2_BROADCAST
+ * / other "standard-range" io_Commands to us — that's the current
+ * theory for why those cases returned IOERR_UNITBUSY (-6) before
+ * BeginIO ran. Terminated by 0.
+ *
+ * If any client asks for a command not in this list, we still
+ * dispatch it (BeginIO's switch handles it or falls to
+ * IOERR_NOCMD) — the list is just what we ADVERTISE. */
+static const UWORD vn_supported_cmds[] = {
+    NSCMD_DEVICEQUERY,
+    CMD_READ,
+    CMD_WRITE,
+    S2_DEVICEQUERY,
+    S2_GETSTATIONADDRESS,
+    S2_CONFIGINTERFACE,
+    S2_ONLINE,
+    S2_OFFLINE,
+    S2_BROADCAST,
+    S2_READORPHAN,
+    S2_ONEVENT,
+    S2_GETGLOBALSTATS,
+    /* Phase 7a: advertise the commands Roadshow issues at bind time
+     * even though we treat them as no-ops. Roadshow's DHCP failure with
+     * "broadcast access not supported" is likely because it calls
+     * S2_ADDMULTICASTADDRESSES(broadcast MAC) and gets IOERR_NOCMD. */
+    S2_TRACKTYPE,
+    S2_UNTRACKTYPE,
+    S2_ADDMULTICASTADDRESS,
+    S2_DELMULTICASTADDRESS,
+    S2_ADDMULTICASTADDRESSES,
+    S2_DELMULTICASTADDRESSES,
+    0
+};
+
+/* e1000 register offsets we currently touch. Full map lives in the QEMU
+ * source at hw/net/e1000_regs.h + the 82540EM datasheet; only the offsets
+ * we actually read/write get named here. Cross-referenced with the design
+ * agent's docs/DESIGN.md §2. */
+#define E1000_REG_CTRL     0x00000
+#define E1000_REG_STATUS   0x00008
+#define E1000_REG_ICR      0x000C0   /* Interrupt Cause Read (RO/read-to-clear) */
+#define E1000_REG_ICS      0x000C8   /* Interrupt Cause Set (WO, forces IRQ) */
+#define E1000_REG_IMS      0x000D0   /* Interrupt Mask Set */
+#define E1000_REG_IMC      0x000D8   /* Interrupt Mask Clear (WO, write 1 to mask) */
+#define E1000_REG_RCTL     0x00100   /* Receive Control */
+#define E1000_REG_TCTL     0x00400   /* Transmit Control */
+#define E1000_REG_RDBAL    0x02800   /* RX Descriptor Base Address Low */
+#define E1000_REG_RDBAH    0x02804   /* RX Descriptor Base Address High */
+#define E1000_REG_RDLEN    0x02808   /* RX Descriptor Length (in bytes) */
+#define E1000_REG_RDH      0x02810   /* RX Descriptor Head */
+#define E1000_REG_RDT      0x02818   /* RX Descriptor Tail */
+#define E1000_REG_TDBAL    0x03800   /* TX Descriptor Base Address Low */
+#define E1000_REG_TDBAH    0x03804
+#define E1000_REG_TDLEN    0x03808
+#define E1000_REG_TDH      0x03810
+#define E1000_REG_TDT      0x03818
+#define E1000_REG_TPT      0x040D4   /* Total Packets Transmitted */
+
+/* Legacy TX descriptor CMD bits (byte 11 of the 16-byte descriptor). */
+#define E1000_TXD_CMD_EOP  (1U << 0)   /* End Of Packet */
+#define E1000_TXD_CMD_IFCS (1U << 1)   /* Insert FCS (CRC) */
+#define E1000_TXD_CMD_RS   (1U << 3)   /* Report Status — set STATUS.DD */
+
+/* Legacy TX descriptor STATUS bits (byte 12). */
+#define E1000_TXD_STAT_DD  (1U << 0)   /* Descriptor Done */
+#define E1000_REG_RAL      0x05400   /* Receive Address Low  */
+#define E1000_REG_RAH      0x05404   /* Receive Address High */
+
+/* Little-endian store to main memory. Descriptor entries live in host RAM
+ * but the e1000 reads them as LE, so we byte-reverse on the store side. */
+static inline void poke_le32(volatile void *p, uint32 v)
 {
-    struct LoOpener *o;
-    for (o = (struct LoOpener *)base->opener_list.mlh_Head;
-         o->node.mln_Succ;
-         o = (struct LoOpener *)o->node.mln_Succ) {
-        if (o->bm_cookie == bm_cookie) return o;
-    }
-    return NULL;
+    __asm__ volatile ("stwbrx %0, 0, %1" : : "r"(v), "r"(p) : "memory");
 }
 
-static BOOL lo_invoke_copy_from(struct LoopbackBase *base,
-                                 struct LoOpener *op,
-                                 struct IOSana2Req *ioreq,
-                                 APTR to, ULONG size)
+/* Phase 13e: read PPC time-base register (lower 32 bits). One
+ * instruction (mftb), a few cycles. Wraps every 43 s at 100 MHz TB
+ * — fine for accumulating per-stage deltas during a benchmark.
+ * SPR 268 on Book-E (`mfspr rX, TBL` = `mftb rX`). */
+static inline uint32 vn_tb(void)
 {
-    if (!op || !base->IUtility) return FALSE;
-    struct Hook *hook = op->sana2_hook ? op->sana2_hook : (struct Hook *)op->copy_from_buff;
-    if (!hook) return FALSE;
-    ULONG tag = op->sana2_hook ? S2_CopyFromBuff : op->copy_from_tag;
-    struct SANA2CopyHookMsg msg;
-    msg.schm_Method  = tag;
-    msg.schm_MsgSize = sizeof(msg);
-    msg.schm_To      = to;
-    msg.schm_From    = ioreq->ios2_Data;
-    msg.schm_Size    = size;
-    return (BOOL)(ULONG)base->IUtility->CallHookPkt(hook, ioreq, &msg);
+    uint32 t;
+    __asm__ volatile ("mftb %0" : "=r"(t));
+    return t;
 }
 
-static BOOL lo_invoke_copy_to(struct LoopbackBase *base,
-                               struct LoOpener *op,
-                               struct IOSana2Req *ioreq,
-                               APTR from, ULONG size)
+/* Full memory barrier — ensures all prior stores complete before any
+ * subsequent memory ops. Required after building a descriptor and
+ * before writing the doorbell (TDT) so HW sees a consistent descriptor.
+ * pa6t_eth calls this pasemi_wmb; same instruction. */
+static inline void vn_wmb(void)
 {
-    if (!op || !base->IUtility) return FALSE;
-    struct Hook *hook = op->sana2_hook ? op->sana2_hook : (struct Hook *)op->copy_to_buff;
-    if (!hook) return FALSE;
-    ULONG tag = op->sana2_hook ? S2_CopyToBuff : op->copy_to_tag;
-    struct SANA2CopyHookMsg msg;
-    msg.schm_Method  = tag;
-    msg.schm_MsgSize = sizeof(msg);
-    msg.schm_To      = ioreq->ios2_Data;
-    msg.schm_From    = from;
-    msg.schm_Size    = size;
-    return (BOOL)(ULONG)base->IUtility->CallHookPkt(hook, ioreq, &msg);
+    __asm__ volatile ("sync" : : : "memory");
 }
 
-/* lo_find_opener is currently unused (dispatch identifies opener via
- * ioreq->ios2_BufferManagement which we replaced with our own ptr in
- * _manager_Open). Keeping declared for future MAC-filter support. */
-__attribute__((used)) static struct LoOpener *lo_find_opener_ref(struct LoopbackBase *b, APTR c) { return lo_find_opener(b, c); }
+/* -------- Phase 6k: unit task ---------- */
 
-/* ---------- The core loopback packet path ---------- */
+/* Forward decl for use by ISR. */
+static void lo_process_rx(struct LoopbackBase *base);
+static void vn_online_hw(struct LoopbackBase *base);
+static void vn_signal_event(struct LoopbackBase *base, ULONG event_mask);
+/* PHASE 7q: full command dispatcher, called from unit task after
+ * BeginIO PutMsg's ioreq to begin_port. Does everything BeginIO used
+ * to do — the switch/case on io_Command. */
+static void lo_dispatch_ioreq(struct LoopbackBase *base,
+                                  struct IOSana2Req *ioreq);
 
-static void lo_deliver(struct LoopbackBase *base,
-                        struct IOSana2Req *tx_req,
-                        struct LoOpener *tx_op)
-{
-    struct ExecIFace *IExec = base->IExec;
-    UBYTE frame[1600];
-
-    ULONG plen = tx_req->ios2_DataLength;
-    if (plen > 1514) plen = 1514;
-
-    for (int i = 0; i < 6; i++) frame[i]     = tx_req->ios2_DstAddr[i];
-    for (int i = 0; i < 6; i++) frame[6 + i] = base->mac[i];
-    uint16 etype = (uint16)(tx_req->ios2_PacketType & 0xFFFF);
-    frame[12] = (UBYTE)(etype >> 8);
-    frame[13] = (UBYTE)(etype & 0xFF);
-
-    BOOL cooked = (tx_op != NULL) && (base->IUtility != NULL) &&
-                  (tx_op->sana2_hook != NULL || tx_op->copy_from_buff != NULL);
-
-    ULONG frame_len;
-    uint32 _c0 = lo_tb();
-    if (cooked) {
-        BOOL ok = lo_invoke_copy_from(base, tx_op, tx_req, frame + 14, plen);
-        if (!ok) {
-            tx_req->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
-            tx_req->ios2_WireError    = S2WERR_BUFF_ERROR;
-            return;
-        }
-        frame_len = 14 + plen;
-    } else {
-        UBYTE *src = (UBYTE *)tx_req->ios2_Data;
-        if (plen > sizeof(frame)) plen = sizeof(frame);
-        for (ULONG i = 0; i < plen; i++) frame[i] = src[i];
-        frame_len = plen;
-    }
-    base->prof_tx_c_cook += (lo_tb() - _c0);
-
-    uint32 _d0 = lo_tb();
-    UBYTE *pay      = frame + 14;
-    ULONG  pay_len  = frame_len - 14;
-    BOOL   delivered = FALSE;
-    IExec->ObtainSemaphore(&base->opener_lock);
-    for (struct LoOpener *o = (struct LoOpener *)base->opener_list.mlh_Head;
-         o->node.mln_Succ;
-         o = (struct LoOpener *)o->node.mln_Succ) {
-        if (!o->read_queue.mlh_Head || !o->read_queue.mlh_Head->mln_Succ) continue;
-        struct IOSana2Req *rx_req = (struct IOSana2Req *)IExec->RemHead(
-            (struct List *)&o->read_queue);
-        IExec->ReleaseSemaphore(&base->opener_lock);
-
-        for (int i = 0; i < 6; i++) rx_req->ios2_SrcAddr[i] = frame[6 + i];
-        for (int i = 0; i < 6; i++) rx_req->ios2_DstAddr[i] = frame[i];
-        rx_req->ios2_PacketType = ((ULONG)frame[12] << 8) | (ULONG)frame[13];
-        rx_req->ios2_DataLength = pay_len;
-
-        BOOL ok = lo_invoke_copy_to(base, o, rx_req, pay, pay_len);
-        rx_req->ios2_Req.io_Error = ok ? 0 : S2ERR_NO_RESOURCES;
-        IExec->ReplyMsg((struct Message *)rx_req);
-        if (ok) {
-            delivered = TRUE;
-            base->packets_rx++;
-            base->bytes_rx += pay_len;
-        }
-        IExec->ObtainSemaphore(&base->opener_lock);
-        break;
-    }
-    IExec->ReleaseSemaphore(&base->opener_lock);
-    base->prof_tx_c_deliver += (lo_tb() - _d0);
-
-    if (!delivered) base->drops_no_reader++;
-}
-
-/* ---------- Unit task ---------- */
-
-static void lo_dispatch_ioreq(struct LoopbackBase *base, struct IOSana2Req *ioreq);
-
+/* Task entry function. Called by CreateTaskTags. Args-less; we recover
+ * our own Task struct via classic-Amiga SysBase-at-4 → FindTask(NULL),
+ * then read tc_UserData for the LoopbackBase pointer. */
 static void lo_task_body(void)
 {
     struct ExecIFace *IExec = ((struct ExecIFace *)
@@ -321,36 +321,75 @@ static void lo_task_body(void)
     struct Task *self = IExec->FindTask(NULL);
     struct LoopbackBase *base = (struct LoopbackBase *)self->tc_UserData;
 
-    base->begin_port = (struct MsgPort *)IExec->AllocSysObjectTags(
-        ASOT_PORT, ASOPORT_AllocSig, TRUE, TAG_END);
-    if (!base->begin_port) {
+    int8 sig = IExec->AllocSignal(-1);
+    if (sig < 0) {
         base->task_ready_ok = FALSE;
         IExec->Signal(base->parent_task, base->parent_ready_mask);
         return;
     }
-    base->unit_signal_mask = 1UL << base->begin_port->mp_SigBit;
+    ULONG sig_mask = 1UL << sig;
+    base->unit_signal_mask = sig_mask;
+
+    /* PHASE 7q: create begin_port here so its signal is registered
+     * to THIS task (signals are per-task). Sig bit auto-allocated by
+     * ASOT_PORT via ASOPORT_AllocSig. */
+    base->begin_port = (struct MsgPort *)IExec->AllocSysObjectTags(
+        ASOT_PORT, ASOPORT_AllocSig, TRUE, TAG_END);
+    if (!base->begin_port) {
+        IExec->FreeSignal(sig);
+        base->unit_signal_mask = 0;
+        base->task_ready_ok = FALSE;
+        IExec->Signal(base->parent_task, base->parent_ready_mask);
+        return;
+    }
+    base->begin_port_mask = 1UL << base->begin_port->mp_SigBit;
 
     base->task_ready_ok = TRUE;
+    /* Handshake — Init is Wait'ing on parent_ready_mask. */
     IExec->Signal(base->parent_task, base->parent_ready_mask);
 
-    for (;;) {
-        ULONG sigs = IExec->Wait(base->unit_signal_mask | SIGBREAKF_CTRL_C);
-        if (sigs & SIGBREAKF_CTRL_C) break;
-        struct IOSana2Req *ioreq;
-        while ((ioreq = (struct IOSana2Req *)IExec->GetMsg(base->begin_port))) {
-            lo_dispatch_ioreq(base, ioreq);
+    ULONG wait_mask = sig_mask | base->begin_port_mask | SIGBREAKF_CTRL_C;
+    while (!base->task_shutdown) {
+        ULONG got = IExec->Wait(wait_mask);
+        if (IExec->SetSignal(0, SIGBREAKF_CTRL_C) & SIGBREAKF_CTRL_C) break;
+
+        /* PHASE 7q: drain begin_port FIRST — RX depends on state
+         * that CONFIGINTERFACE / ONLINE handlers set up. */
+        if (got & base->begin_port_mask) {
+            struct IOSana2Req *req;
+            while ((req = (struct IOSana2Req *)IExec->GetMsg(base->begin_port)) != NULL) {
+                lo_dispatch_ioreq(base, req);
+            }
+        }
+
+        if (got & sig_mask) {
+            IExec->SetSignal(0, sig_mask);   /* consume all pending IRQ signals */
+            base->task_wake_count++;
+            lo_process_rx(base);
         }
     }
+
+    /* Cleanup — task exits after this returns. */
+    if (base->begin_port) {
+        IExec->FreeSysObject(ASOT_PORT, base->begin_port);
+        base->begin_port = NULL;
+        base->begin_port_mask = 0;
+    }
+    IExec->FreeSignal(sig);
+    base->unit_signal_mask = 0;
+    base->unit_task = NULL;
 }
 
+/* Called from Init. Spawns the task; waits until task signals ready. */
 static BOOL lo_task_start(struct LoopbackBase *base, struct ExecIFace *iexec)
 {
-    LONG ready_bit = iexec->AllocSignal(-1);
+    int8 ready_bit = iexec->AllocSignal(-1);
     if (ready_bit < 0) return FALSE;
 
-    base->task_ready_ok      = FALSE;
-    base->parent_task        = iexec->FindTask(NULL);
-    base->parent_ready_mask  = 1UL << ready_bit;
+    base->task_shutdown     = FALSE;
+    base->task_ready_ok     = FALSE;
+    base->parent_task       = iexec->FindTask(NULL);
+    base->parent_ready_mask = 1UL << ready_bit;
 
     iexec->Forbid();
     struct Task *t = iexec->CreateTaskTags("loopback-unit", 20,
@@ -361,55 +400,539 @@ static BOOL lo_task_start(struct LoopbackBase *base, struct ExecIFace *iexec)
     iexec->Permit();
 
     if (!t) { iexec->FreeSignal(ready_bit); return FALSE; }
+
     (void)iexec->Wait(base->parent_ready_mask);
     iexec->FreeSignal(ready_bit);
     return base->task_ready_ok;
 }
 
-/* ---------- Init / Open / Close / Expunge / BeginIO / AbortIO ---------- */
-
-struct Library *_manager_Init(struct Library *lib, BPTR seglist, struct Interface *exec)
+/* Called from Expunge. */
+static void lo_task_stop(struct LoopbackBase *base, struct ExecIFace *IExec)
 {
+    if (!base->unit_task) return;
+    base->task_shutdown = TRUE;
+    IExec->Signal(base->unit_task, SIGBREAKF_CTRL_C);
+    /* Yield until the task clears itself. */
+    ULONG patience = 100000;
+    while (base->unit_task && patience-- > 0) {
+        IExec->Forbid();
+        IExec->Permit();
+    }
+}
+
+/* Find the opener matching this request's bm_cookie. NULL if none —
+ * unusual (Open would have added one), but Close-race-safe. Caller
+ * should hold opener_lock (unless within Init/Expunge). */
+static struct LoOpener *vn_find_opener(struct LoopbackBase *base,
+                                              APTR bm_cookie)
+{
+    struct LoOpener *op;
+    for (op = (struct LoOpener *)base->opener_list.mlh_Head;
+         op->node.mln_Succ;
+         op = (struct LoOpener *)op->node.mln_Succ) {
+        if (op->bm_cookie == bm_cookie) return op;
+    }
+    return NULL;
+}
+
+/* Walk every opener's event_queue; for each request whose
+ * ios2_WireError (caller-set mask) intersects event_mask, remove
+ * from queue, set WireError to the matched bits, and ReplyMsg.
+ * Called from S2_ONLINE / S2_OFFLINE handlers on state transitions.
+ * Mirrors pa6t_eth's signal_event() but per-opener queue rather
+ * than per-driver event_list. */
+static void vn_signal_event(struct LoopbackBase *base, ULONG event_mask)
+{
+    struct ExecIFace *IExec = base->IExec;
+    IExec->ObtainSemaphore(&base->opener_lock);
+    struct LoOpener *op;
+    for (op = (struct LoOpener *)base->opener_list.mlh_Head;
+         op->node.mln_Succ;
+         op = (struct LoOpener *)op->node.mln_Succ) {
+        struct MinNode *n = op->event_queue.mlh_Head, *next;
+        while ((next = n->mln_Succ) != NULL) {
+            /* Node is at offset 0 of IOSana2Req - direct cast. */
+            struct IOSana2Req *r = (struct IOSana2Req *)n;
+            ULONG mask = r->ios2_WireError;
+            ULONG match = mask & event_mask;
+            if (match) {
+                IExec->Remove((struct Node *)n);
+                r->ios2_WireError    = match;
+                r->ios2_Req.io_Error = 0;
+                IExec->ReplyMsg((struct Message *)r);
+            }
+            n = next;
+        }
+    }
+    IExec->ReleaseSemaphore(&base->opener_lock);
+}
+
+/* Resolve a CPU-virtual allocation to its PCI-bus physical address
+ * via the OS4-blessed StartDMA + GetDMAList path (pa6t_eth pattern).
+ * Returns 0 on failure. Caller should have kept the allocation in the
+ * DMA state via StartDMA — this function releases via EndDMA before
+ * returning, which is fine for one-shot alloc-and-forget or when
+ * we're doing StartDMA per operation. For the driver's long-lived
+ * ring memory we keep the mapping alive until Expunge (see Init). */
+static uint32 vn_dma_phys(struct ExecIFace *IExec, void *virt,
+                             uint32 size, uint32 flags)
+{
+    uint32 nentries = IExec->StartDMA(virt, size, flags);
+    if (nentries == 0) return 0;
+    struct DMAEntry *dlist = (struct DMAEntry *)IExec->AllocSysObjectTags(
+        ASOT_DMAENTRY, ASODMAE_NumEntries, nentries, TAG_DONE);
+    if (!dlist) {
+        IExec->EndDMA(virt, size, flags | DMAF_NoModify);
+        return 0;
+    }
+    IExec->GetDMAList(virt, size, flags, dlist);
+    uint32 phys = (uint32)dlist[0].PhysicalAddress;
+    if (nentries > 1) {
+        IExec->DebugPrintF("[loopback] dma_phys: WARNING non-contiguous virt=%p size=%lu nentries=%lu\n",
+                           virt, size, nentries);
+    }
+    IExec->FreeSysObject(ASOT_DMAENTRY, dlist);
+    return phys;
+}
+
+/* Forward decls — real definitions live further down with the other
+ * MMIO helpers. The ISR below needs to call e1000_read32(ICR); the
+ * Phase 6k lo_process_rx also uses e1000_write32(RDT). */
+static inline uint32 e1000_read32(volatile void *base, uint32 off);
+static inline void   e1000_write32(volatile void *base, uint32 off, uint32 val);
+
+/* Ring sizing — used by lo_process_rx (which is above Init where
+ * these are also referenced during ring alloc). Moved here so both
+ * users see them; keeping the values single-source-of-truth. */
+#define VN_RING_ENTRIES   16
+#define VN_DESC_SIZE      16
+#define VN_RX_BUFSIZE     2048
+/* Phase 13b: per-slot TX scratch pool sizing. 2KB per slot fits any
+ * virtio_net_hdr (10) + max Ethernet frame (1514). 32 slots × 2KB =
+ * 64KB total. desc_slot in CMD_WRITE picks a slot via modulo, so
+ * long as Roadshow can't queue >32 TX requests faster than QEMU
+ * drains them, no in-flight buffer gets overwritten. */
+#define VN_TX_SLOT_SIZE   2048UL
+/* One pool slot per descriptor — pool_slot = desc_slot directly, no
+ * wrap-back race even if Roadshow's dispatch storm drains the whole
+ * ring before QEMU processes anything. 256 × 2KB = 512KB total. */
+#define VN_TX_POOL_SLOTS  256UL
+
+/* SANA-II Rev 4 has two CopyTo/CopyFromBuff ABIs. The classic tag
+ * S2_CopyToBuff / S2_CopyFromBuff points at a m68k asm function that
+ * takes (a0=to, a1=from, d0=size) and returns d0=bool — on OS4 we call
+ * it via IExec->EmulateTags. The newer S2_CopyToBuff16 / 32 (and their
+ * CopyFromBuff twins) point at a struct Hook* that accepts a
+ * SANA2CopyHookMsg — invoked via IUtility->CallHookPkt. Roadshow on
+ * OS4 supplies BOTH; picking the wrong ABI causes a DSI on first RX
+ * delivery (calling a code pointer as a Hook* jumps to bytes 8 into
+ * the function). op->copy_*_tag records which one we resolved at
+ * Open, and these helpers dispatch accordingly. */
+typedef BOOL (*V1000CopyFn)(APTR to, APTR from, ULONG size);
+
+/* Phase 8d: kill switch OFF. With S2_SANA2HOOK now handled properly
+ * (Roadshow's preferred delivery path), invoke_copy_to/from should
+ * hit the sana2_hook branch first — a CallHookPkt on a legit Hook*
+ * with a proper SANA2CopyHookMsg. That eliminates the wrong-ABI
+ * hypothesis that motivated this bypass. */
+#define VN_BYPASS_COPYHOOKS 0
+
+static BOOL vn_invoke_copy_to(struct LoopbackBase *base,
+                                 struct LoOpener *op,
+                                 struct IOSana2Req *ioreq,
+                                 APTR from, ULONG size)
+{
+    if (!op) return FALSE;
+    base->copy_to_calls++;
+    base->last_copy_to_size = size;
+
+    /* Preferred path: Roadshow installed a Sana2Hook via S2_SANA2HOOK.
+     * That hook services multiple methods; invoke with schm_Method =
+     * S2_CopyToBuff and a SANA2CopyHookMsg. Falls through to tag-list
+     * fallback if the hook wasn't installed. */
+    if (op->sana2_hook) {
+        base->last_copy_to_ptr = op->sana2_hook;
+        base->last_copy_to_tag = S2_CopyToBuff;
+        struct SANA2CopyHookMsg msg;
+        msg.schm_Method  = S2_CopyToBuff;
+        msg.schm_MsgSize = sizeof(msg);
+        msg.schm_To      = ioreq->ios2_Data;
+        msg.schm_From    = from;
+        msg.schm_Size    = size;
+        return (BOOL)(ULONG)base->IUtility->CallHookPkt(
+            op->sana2_hook, ioreq, &msg);
+    }
+    if (!op->copy_to_buff) return FALSE;
+    base->last_copy_to_ptr = op->copy_to_buff;
+    base->last_copy_to_tag = op->copy_to_tag;
+    /* Per Bill Borsari's fix on the sibling e1000 driver
+     * (amiga-e1000-driver c0fc9e7): ALWAYS invoke Copy* hooks via
+     * CallHookPkt, even when the "classic" S2_CopyToBuff tag is
+     * present. On OS4 Roadshow that tag ALSO points at a struct
+     * Hook*, not a raw fn ptr — calling it as a function jumps 8
+     * bytes into the Hook struct and writes garbage. Cross-driver
+     * proof: same fix took virte1000 from malformed payloads to
+     * valid IPv4 on the wire in one commit. */
+    struct SANA2CopyHookMsg msg;
+    msg.schm_Method  = op->copy_to_tag;
+    msg.schm_MsgSize = sizeof(msg);
+    msg.schm_To      = ioreq->ios2_Data;
+    msg.schm_From    = from;
+    msg.schm_Size    = size;
+    return (BOOL)(ULONG)base->IUtility->CallHookPkt(
+        (struct Hook *)op->copy_to_buff, ioreq, &msg);
+}
+
+static BOOL vn_invoke_copy_from(struct LoopbackBase *base,
+                                   struct LoOpener *op,
+                                   struct IOSana2Req *ioreq,
+                                   APTR to, ULONG size)
+{
+    if (!op) return FALSE;
+    base->copy_from_calls++;
+    base->last_copy_from_size = size;
+
+    if (op->sana2_hook) {
+        base->last_copy_from_ptr = op->sana2_hook;
+        base->last_copy_from_tag = S2_CopyFromBuff;
+        struct SANA2CopyHookMsg msg;
+        msg.schm_Method  = S2_CopyFromBuff;
+        msg.schm_MsgSize = sizeof(msg);
+        msg.schm_To      = to;
+        msg.schm_From    = ioreq->ios2_Data;
+        msg.schm_Size    = size;
+        return (BOOL)(ULONG)base->IUtility->CallHookPkt(
+            op->sana2_hook, ioreq, &msg);
+    }
+    if (!op->copy_from_buff) return FALSE;
+    base->last_copy_from_ptr = op->copy_from_buff;
+    base->last_copy_from_tag = op->copy_from_tag;
+    /* Same fix as vn_invoke_copy_to — Bill Borsari's ALWAYS-CallHookPkt
+     * pattern from amiga-e1000-driver c0fc9e7. See that function's
+     * comment for the full rationale. */
+    struct SANA2CopyHookMsg msg;
+    msg.schm_Method  = op->copy_from_tag;
+    msg.schm_MsgSize = sizeof(msg);
+    msg.schm_To      = to;
+    msg.schm_From    = ioreq->ios2_Data;
+    msg.schm_Size    = size;
+    return (BOOL)(ULONG)base->IUtility->CallHookPkt(
+        (struct Hook *)op->copy_from_buff, ioreq, &msg);
+}
+
+/* Walk the RX ring, deliver frames to queued CMD_READ requests via the
+ * opener's CopyToBuff hook, reset descriptors + advance RDT so HW can
+ * refill the slot. Called from the unit task on IRQ signal. */
+static void lo_process_rx(struct LoopbackBase *base)
+{
+    /* Loopback: no wire RX. CMD_WRITE handler delivers to opener
+     * read-queues directly. Leave hardware RX ring untouched. */
+    (void)base;
+    return;
+    if (!base->rx_vring || !base->IUtility) return;
+    uint32 _pr0 = vn_tb();     /* Phase 13e: RX profile entry */
+    uint32 _pr_hook_c = 0;     /* accumulate copy-hook cycles inside loop */
+    struct ExecIFace *IExec = base->IExec;
+
+    UWORD num = base->rx_vring_num;
+    /* All ring fields are LITTLE-ENDIAN on QEMU virtio-net-pci —
+     * use vio_le*_get / vio_le*_put to access them from BE PPC. */
+    UBYTE *avail_bytes = ((UBYTE *)base->rx_vring) + VRING_AVAIL_OFFSET(num);
+    struct vring_avail_header *avail = (struct vring_avail_header *)avail_bytes;
+    uint16 *avail_ring = (uint16 *)(avail_bytes + 4);
+    UBYTE *used_bytes  = ((UBYTE *)base->rx_vring) + VRING_USED_OFFSET(num);
+    struct vring_used_header *used = (struct vring_used_header *)used_bytes;
+    struct vring_used_elem *used_ring = (struct vring_used_elem *)(used_bytes + 4);
+
+    /* Memory barrier before reading device-owned idx. */
+    __asm__ volatile ("eieio; sync" : : : "memory");
+    UWORD cur_used_idx = vio_le16_get(&used->idx);
+    UWORD last = base->rx_last_used;
+    ULONG delivered = 0;
+    ULONG iterated = 0;
+
+    while (last != cur_used_idx) {
+        iterated++;
+        UWORD slot = last % num;
+        UWORD desc_idx = (UWORD)vio_le32_get(&used_ring[slot].id);
+        ULONG bytes_used = vio_le32_get(&used_ring[slot].len);
+
+        if (desc_idx >= num) {
+            base->process_rx_dd_seen++;
+            last++;
+            continue;
+        }
+        if (bytes_used < VIRTIO_NET_HDR_LEN + 14) {
+            last++;
+            vio_le16_put(&avail_ring[vio_le16_get(&avail->idx) % num], desc_idx);
+            __asm__ volatile ("eieio; sync" : : : "memory");
+            vio_le16_put(&avail->idx, vio_le16_get(&avail->idx) + 1);
+            continue;
+        }
+
+        UBYTE *rxbuf = (UBYTE *)base->rx_bufs + (desc_idx * VN_RX_BUFSIZE);
+        UBYTE *eth   = rxbuf + VIRTIO_NET_HDR_LEN;
+        ULONG eth_len = bytes_used - VIRTIO_NET_HDR_LEN;
+        ULONG payload_len = eth_len - 14;
+
+        struct IOSana2Req *ioreq = NULL;
+        struct LoOpener *op   = NULL;
+        IExec->ObtainSemaphore(&base->opener_lock);
+        for (struct LoOpener *o = (struct LoOpener *)base->opener_list.mlh_Head;
+             o->node.mln_Succ;
+             o = (struct LoOpener *)o->node.mln_Succ) {
+            if (o->read_queue.mlh_Head && o->read_queue.mlh_Head->mln_Succ) {
+                op = o;
+                ioreq = (struct IOSana2Req *)IExec->RemHead((struct List *)&o->read_queue);
+                break;
+            }
+        }
+        IExec->ReleaseSemaphore(&base->opener_lock);
+
+        if (ioreq && op && ioreq->ios2_Data) {
+            for (int i = 0; i < 6; i++) ioreq->ios2_SrcAddr[i] = eth[6 + i];
+            for (int i = 0; i < 6; i++) ioreq->ios2_DstAddr[i] = eth[i];
+            ioreq->ios2_PacketType = ((ULONG)eth[12] << 8) | (ULONG)eth[13];
+            ioreq->ios2_DataLength = payload_len;
+
+            uint32 _pr_hook_start = vn_tb();
+            BOOL ok = vn_invoke_copy_to(base, op, ioreq, eth + 14, payload_len);
+            _pr_hook_c += (vn_tb() - _pr_hook_start);
+            ioreq->ios2_Req.io_Error = ok ? 0 : S2ERR_NO_RESOURCES;
+            IExec->ReplyMsg((struct Message *)ioreq);
+            if (ok) delivered++;
+        }
+
+        /* Refill descriptor. */
+        vio_le16_put(&avail_ring[vio_le16_get(&avail->idx) % num], desc_idx);
+        __asm__ volatile ("eieio; sync" : : : "memory");
+        vio_le16_put(&avail->idx, vio_le16_get(&avail->idx) + 1);
+        last++;
+    }
+
+    base->rx_last_used = last;
+    base->process_rx_delivered += delivered;
+
+    /* Phase 13d: under EVENT_IDX the device only interrupts us when
+     * its used->idx crosses the used_event we published in the avail
+     * ring's trailing slot. QEMU uses
+     *   need_event(event, new_idx, old_idx) =
+     *     (uint16)(new_idx - event - 1) < (uint16)(new_idx - old_idx)
+     * so with `event = last` (the used_idx we've already drained),
+     * the next arrival (old=last, new=last+1) evaluates to
+     * `0 < 1` = fire. Bumping to `last+1` would give `0xFFFF < 1`
+     * = false and we'd miss every wake — that path was tried and
+     * dropped perf 14x. */
+    if (base->driver_features & VIRTIO_F_RING_EVENT_IDX) {
+        uint16 *rx_used_event = (uint16 *)(avail_bytes + 4 + 2 * num);
+        vio_le16_put(rx_used_event, (uint16)last);
+        __asm__ volatile ("eieio; sync" : : : "memory");
+        /* If the device raced past our new used_event while we were
+         * arming it, we'll miss the interrupt for those entries.
+         * Since our task always re-runs after any ISR wake, this
+         * only matters when nothing else fires — the wake-loop below
+         * covers that by checking used->idx once more after we set
+         * the event. If it's ahead, we already know we still need to
+         * process; the vn_isr code will re-enter us. */
+    }
+
+    if (iterated > 0) {
+        __asm__ volatile ("eieio; sync" : : : "memory");
+        virtio_notify_queue(base, VIRTIO_NET_Q_RX);
+    }
+
+    /* Phase 13e: RX profile — accumulate. Only count invocations
+     * that actually did work (iterated > 0); empty wakes would
+     * inflate the average. */
+    if (iterated > 0) {
+        base->prof_rx_calls++;
+        base->prof_rx_pkts   += delivered;
+        base->prof_rx_c_hook += _pr_hook_c;
+        base->prof_rx_c_total += (vn_tb() - _pr0);
+    }
+}
+
+/* -------- Phase 5b: ISR ----------
+ * Runs at exec interrupt level on the shared PCI INTx chain. Contract per
+ * exec IntServer autodoc + VirtualSCSIDevice's virtio_irq.c:
+ *   - No memory allocation, no blocking, no library calls beyond IExec
+ *     essentials (Signal/Cause/similar).
+ *   - No DebugPrintF (deadlock risk).
+ *   - Return non-zero if we recognised and claimed this interrupt;
+ *     return zero to let the next server on the chain look at it.
+ *
+ * Reading ICR both TELLS us what fired AND acknowledges the causes
+ * (read-to-clear per DESIGN.md §6). We stash the last non-zero value
+ * in devBase->last_icr for post-hoc inspection by test programs;
+ * they read it via the driver-private query command added in Phase 5e.
+ *
+ * When IMS is 0 (Phase 5b) no cause is unmasked so ICR reads here
+ * should be 0 and we always return 0 (not-ours). That's the safest
+ * starting point: we're on the chain but never claim, so an install
+ * bug can't storm. */
+static uint32 vn_isr(struct ExceptionContext *ctx,
+                        struct ExecBase *sysbase, APTR is_Data)
+{
+    struct LoopbackBase *base = (struct LoopbackBase *)is_Data;
+    (void)ctx; (void)sysbase;
+
+    /* DIAGNOSTIC: increment every entry regardless of ISR value so we
+     * can tell "ISR never runs" (task_wake_count stays 0) vs "ISR runs
+     * but VIRTIO_PCI_ISR reads 0 every time" (task_wake_count grows
+     * but irq_counter stays 0). Repurpose task_wake_count for this
+     * count temporarily. */
+    base->task_wake_count++;
+
+    /* virtio legacy: read VIRTIO_PCI_ISR. It's read-to-clear.
+     * bit 0 = queue-used advanced, bit 1 = config changed.
+     *
+     * Phase 12b: on this QEMU sam460ex / virtio-net-pci-legacy combo
+     * the ISR register READS 0 every time even though QEMU fires
+     * IRQ (we recorded 52 ISR entries with irq_counter=0 = "we
+     * ran but saw 0"). Root cause unknown — QEMU may clear the
+     * bit before delivery, or the read may hit a race, or the
+     * INTx line is being delivered before ISR bit is set.
+     *
+     * Since our ISR being called at all is enough evidence a
+     * queue event happened (we're the ONLY device on this vector
+     * per MapInterrupt), unconditionally signal the unit task.
+     * Cost: unit task wakes on unrelated shared-INT storms too,
+     * but lo_process_rx is idempotent (returns early if used ring
+     * didn't advance) so worst case is wasted wake-ups. */
+    if (!base->io_base) return 0;
+    UBYTE isr = base->pciDevice->InByte(base->io_base + VIRTIO_PCI_ISR);
+    base->irq_counter++;
+    base->last_icr = (uint32)isr;   /* reuse existing DBG field for compat */
+
+    if (base->unit_task && base->unit_signal_mask) {
+        struct ExecIFace *IExec = base->IExec;
+        IExec->Signal(base->unit_task, base->unit_signal_mask);
+    }
+    return 1;
+}
+
+/* STATUS register bits (§2 of DESIGN.md, e1000x_regs.h:STATUS_*) */
+#define E1000_STATUS_FD    (1U << 0)   /* Full Duplex */
+#define E1000_STATUS_LU    (1U << 1)   /* Link Up */
+#define E1000_STATUS_SPEED_MASK   (3U << 6)
+#define E1000_STATUS_SPEED_SHIFT  6
+
+/* PPC MMIO helpers. e1000 registers are little-endian; PPC 460EX is
+ * big-endian; we use the byte-reversed load/store insns (lwbrx/stwbrx)
+ * so we can dereference LE registers without an explicit bswap step.
+ * `volatile` on the pointer stops GCC from caching or reordering. */
+static inline uint32 e1000_read32(volatile void *base, uint32 off)
+{
+    volatile uint8 *p = (volatile uint8 *)base + off;
+    uint32 v;
+    __asm__ volatile ("lwbrx %0, 0, %1; eieio" : "=r"(v) : "r"(p) : "memory");
+    return v;
+}
+
+static inline void e1000_write32(volatile void *base, uint32 off, uint32 val)
+{
+    volatile uint8 *p = (volatile uint8 *)base + off;
+    __asm__ volatile ("stwbrx %0, 0, %1; eieio" : : "r"(val), "r"(p) : "memory");
+}
+
+/* Diagnostic scope — held open across Init so we can FPrintf status lines
+ * inline. We use FPrintf (varargs, works with C promotion rules) rather
+ * than VFPrintf (takes a ULONG* argarray in the AmigaDOS convention, which
+ * fights with PPC va_list ABI and garbled our earlier attempts).
+ *
+ * DebugPrintF on this QEMU target isn't wired to the kernel serial port,
+ * so a status file is the only observability channel that works before
+ * PCI/MMIO is up. Test scripts read it back via /api/file. */
+struct LoLogCtx {
+    struct Library *DOSBase;
+    struct DOSIFace *IDOS;
+    BPTR fh;
+};
+
+static void lo_log_open(struct ExecIFace *IExec, struct LoLogCtx *ctx)
+{
+    ctx->DOSBase = NULL; ctx->IDOS = NULL; ctx->fh = (BPTR)NULL;
+    ctx->DOSBase = IExec->OpenLibrary("dos.library", 51);
+    if (!ctx->DOSBase) return;
+    ctx->IDOS = (struct DOSIFace *)IExec->GetInterface(ctx->DOSBase, "main", 1, NULL);
+    if (!ctx->IDOS) { IExec->CloseLibrary(ctx->DOSBase); ctx->DOSBase = NULL; return; }
+    /* MODE_NEWFILE truncates on each Init so we only ever see the latest
+     * run's status. If you want the history, tail /api/logs instead. */
+    ctx->fh = ctx->IDOS->Open((CONST_STRPTR)VIRTNET_STATUS_FILE, MODE_NEWFILE);
+}
+
+static void lo_log_close(struct ExecIFace *IExec, struct LoLogCtx *ctx)
+{
+    if (ctx->fh) { ctx->IDOS->Close(ctx->fh); ctx->fh = (BPTR)NULL; }
+    if (ctx->IDOS) { IExec->DropInterface((struct Interface *)ctx->IDOS); ctx->IDOS = NULL; }
+    if (ctx->DOSBase) { IExec->CloseLibrary(ctx->DOSBase); ctx->DOSBase = NULL; }
+}
+
+/* Emit one line — no-op if any part of the log context failed to open. */
+#define LOGF(ctx, ...) \
+    do { if ((ctx).fh) (ctx).IDOS->FPrintf((ctx).fh, __VA_ARGS__); } while (0)
+
+struct Library *_manager_Init(struct Library *library, BPTR seglist, struct Interface *exec)
+{
+    struct LoopbackBase *devBase = (struct LoopbackBase *)library;
     struct ExecIFace *iexec = (struct ExecIFace *)exec;
-    struct LoopbackBase *base = (struct LoopbackBase *)lib;
-    base->IExec       = iexec;
-    base->dev_SegList = seglist;
-    base->state       = LO_STATE_OFFLINE;
 
-    struct LoLogCtx log = {0};
+    iexec->DebugPrintF("[loopback] Init: %s\n", DEVVERSIONSTRING_FULL);
+
+    struct LoLogCtx log;
     lo_log_open(iexec, &log);
-    LOGF(log, (CONST_STRPTR)"=== Init %s %ld.%ld (%s) ===\n",
-         (CONST_STRPTR)DEVNAME, (LONG)DEVMAJOR, (LONG)DEVMINOR,
-         (CONST_STRPTR)__DATE__);
+    LOGF(log, (CONST_STRPTR)"=== Init %s ===\n", (STRPTR)DEVVERSIONSTRING_FULL);
 
-    /* Explicitly fill dd_Library fields — matches virtnet.device
-     * which works. LIBF_SUMUSED | LIBF_CHANGED is what virtnet uses;
-     * exec accepts these on OS4 (LIBF_CHANGED just means "please
-     * recompute checksum next time"; SumLibrary is a stub for
-     * modern-interface devices). */
-    base->dev_Base.dd_Library.lib_Node.ln_Type = NT_DEVICE;
-    base->dev_Base.dd_Library.lib_Node.ln_Pri  = 0;
-    base->dev_Base.dd_Library.lib_Node.ln_Name = (STRPTR)DEVNAME;
-    base->dev_Base.dd_Library.lib_Flags        = LIBF_SUMUSED | LIBF_CHANGED;
-    base->dev_Base.dd_Library.lib_Version      = DEVMAJOR;
-    base->dev_Base.dd_Library.lib_Revision     = DEVREVISION;
-    base->dev_Base.dd_Library.lib_IdString     = (STRPTR)DEVVERSIONSTRING;
+    devBase->IExec = iexec;
+    devBase->dev_SegList = seglist;
+    iexec->InitSemaphore(&devBase->io_lock);
 
-    iexec->InitSemaphore(&base->io_lock);
-    iexec->InitSemaphore(&base->opener_lock);
-    iexec->NewList((struct List *)&base->opener_list);
+    /* All PCI-side fields start NULL. Any partial-init failure below leaves
+     * them NULL, and Expunge unconditionally frees only what is non-NULL.
+     * hw_present tracks "PCI enum + BAR mapping both succeeded" as one
+     * flag so BeginIO can gate on a single boolean instead of null-checking
+     * every pointer. */
+    devBase->ExpansionBase = NULL;
+    devBase->IPCI          = NULL;
+    devBase->pciDevice     = NULL;
+    devBase->bar0          = NULL;
+    devBase->hw_present    = FALSE;
+    devBase->rx_ring       = NULL;
+    devBase->tx_ring       = NULL;
+    devBase->rx_buffers    = NULL;
+    devBase->rx_ring_phys  = 0;
+    devBase->tx_ring_phys  = 0;
+    devBase->rx_buffers_phys = 0;
+    devBase->tx_scratch    = NULL;
+    devBase->tx_scratch_phys = 0;
+    devBase->irq_vector    = 0;
+    devBase->irq_installed = FALSE;
+    devBase->irq_counter   = 0;
+    devBase->last_icr      = 0;
+    devBase->state         = LO_STATE_OFFLINE;
+    devBase->tx_next_slot  = 0;
+    devBase->UtilityBase   = NULL;
+    devBase->IUtility      = NULL;
+    iexec->NewList((struct List *)&devBase->opener_list);
+    iexec->InitSemaphore(&devBase->opener_lock);
 
-    /* Initialize the embedded lo_unit. Exec's async dispatch path
-     * (SendIO / DoIO for non-QUICK requests) checks unit_MsgPort;
-     * an uninitialized MsgPort with a NULL mp_MsgList head causes
-     * PutMsg to walk into random memory and OpenDevice to hang.
-     * PA_IGNORE + empty list means "we handle everything in BeginIO
-     * ourselves; no signal, no consumer task on the unit port". */
+    /* Phase 6d: init the embedded unit's MsgPort. PA_IGNORE tells exec
+     * "don't queue+signal, just call BeginIO synchronously". That's the
+     * behavior we already implement — BeginIO handles everything inline
+     * and calls ReplyMsg when IOF_QUICK is clear. mp_MsgList must still
+     * be a valid empty List so nothing dereferences a NULL head/tail. */
     {
-        struct Unit *u = &base->lo_unit;
+        struct Unit *u = &devBase->lo_unit;
         u->unit_MsgPort.mp_Node.ln_Type = NT_MSGPORT;
         u->unit_MsgPort.mp_Node.ln_Name = (STRPTR)DEVNAME;
         u->unit_MsgPort.mp_Node.ln_Pri  = 0;
+        /* PA_IGNORE: our BeginIO handles requests synchronously; no
+         * consumer task is needed. Empirically neither PA_IGNORE nor
+         * PA_SIGNAL with a real SigTask unblocks CMD_WRITE via DoIO —
+         * exec has a deeper check we haven't identified yet (returns
+         * IOERR_UNITBUSY before BeginIO runs). The other IO paths
+         * (DEVICEQUERY, GETSTATIONADDRESS, ONLINE/OFFLINE, private
+         * DBG commands) work fine with either mode. */
         u->unit_MsgPort.mp_Flags        = PA_IGNORE;
         u->unit_MsgPort.mp_SigBit       = 0;
         u->unit_MsgPort.mp_SigTask      = NULL;
@@ -418,379 +941,2041 @@ struct Library *_manager_Init(struct Library *lib, BPTR seglist, struct Interfac
         u->unit_pad     = 0;
         u->unit_OpenCnt = 0;
     }
+    for (int i = 0; i < 6; i++) devBase->mac[i] = 0;
 
-    /* Default MAC — locally-administered range. */
-    base->mac[0] = 0x02;
-    base->mac[1] = 0x4C; /* 'L' */
-    base->mac[2] = 0x42; /* 'B' */
-    base->mac[3] = 0x00;
-    base->mac[4] = 0x00;
-    base->mac[5] = 0x01;
+    devBase->dev_Base.dd_Library.lib_Node.ln_Type = NT_DEVICE;
+    devBase->dev_Base.dd_Library.lib_Node.ln_Pri  = 0;
+    devBase->dev_Base.dd_Library.lib_Node.ln_Name = (STRPTR)DEVNAME;
+    devBase->dev_Base.dd_Library.lib_Flags        = LIBF_SUMUSED | LIBF_CHANGED;
+    devBase->dev_Base.dd_Library.lib_Version      = DEVVER;
+    devBase->dev_Base.dd_Library.lib_Revision     = DEVREV;
+    devBase->dev_Base.dd_Library.lib_IdString     = (STRPTR)DEVVERSIONSTRING;
 
-    /* Init tracer — marker for QEMU-monitor grep, and a signal
-     * that Init reached this point. */
-    base->packets_tx = 0xDEADBEEF;
-    base->packets_rx = 0xFEEDFACE;
-    base->bytes_tx   = 0xC0FFEE00;
-    base->bytes_rx   = (ULONG)base;   /* self-address so we can find base */
+    /* -------- Phase 3a: safe PCI enumeration ----------
+     * Try to open expansion.library, get IPCI, and locate the e1000. Any
+     * failure at any step is logged and left as NULL — Init STILL returns
+     * OK so the loop test (testopen) keeps passing. Hardware ops added in
+     * later phases will refuse cleanly if pciDevice is NULL. */
 
-    base->UtilityBase = iexec->OpenLibrary("utility.library", 51);
-    if (base->UtilityBase) {
-        base->IUtility = (struct UtilityIFace *)iexec->GetInterface(
-            base->UtilityBase, "main", 1, NULL);
+    /* utility.library — needed for GetTagData at Open time and
+     * CallHookPkt for cooked-mode TX/RX copies. Open before PCI stuff
+     * so we can bail cleanly if it's not available. */
+    devBase->UtilityBase = iexec->OpenLibrary("utility.library", 50);
+    if (devBase->UtilityBase) {
+        devBase->IUtility = (struct UtilityIFace *)
+            iexec->GetInterface(devBase->UtilityBase, "main", 1, NULL);
     }
-    LOGF(log, (CONST_STRPTR)"utility: %s\n",
-         base->IUtility ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"FAILED");
+    LOGF(log, (CONST_STRPTR)"utility.library: %s IUtility=%p\n",
+         devBase->UtilityBase ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"FAILED",
+         devBase->IUtility);
 
-    BOOL task_ok = lo_task_start(base, iexec);
-    LOGF(log, (CONST_STRPTR)"unit task: %s\n",
-         task_ok ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"FAILED");
-    LOGF(log, (CONST_STRPTR)"Init done: state=OFFLINE mac=%02lx:%02lx:%02lx:%02lx:%02lx:%02lx\n",
-         (ULONG)base->mac[0], (ULONG)base->mac[1], (ULONG)base->mac[2],
-         (ULONG)base->mac[3], (ULONG)base->mac[4], (ULONG)base->mac[5]);
-    LOGF(log, (CONST_STRPTR)"base=%p packets_tx=@%p\n",
-         base, &base->packets_tx);
+    /* Loopback: skip PCI enum entirely. We are pure software — no HW
+     * to enumerate, and grabbing the virtio-net PCI device would
+     * conflict with virtnet.device. Wire a synthetic MAC + link-up
+     * state so Roadshow sees a "hardware present" interface. */
+    for (int i = 0; i < 6; i++) devBase->mac[i] = 0;
+    devBase->mac[0] = 0x02; devBase->mac[1] = 0x4C; devBase->mac[2] = 0x42;
+    devBase->mac[5] = 0x01;
+    devBase->hw_present = TRUE;
+    LOGF(log, (CONST_STRPTR)"loopback: PCI skipped; synthetic MAC 02:4C:42:00:00:01, hw_present=TRUE\n");
+
+    BOOL lo_task_ok = lo_task_start(devBase, iexec);
+    LOGF(log, (CONST_STRPTR)"unit task: %s (task=%p mask=%08lx begin_port=%p)\n",
+         lo_task_ok ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"FAILED",
+         devBase->unit_task, (ULONG)devBase->unit_signal_mask,
+         devBase->begin_port);
+    LOGF(log, (CONST_STRPTR)"Init done: state=OFFLINE (need S2_CONFIGINTERFACE + S2_ONLINE)\n");
     lo_log_close(iexec, &log);
+    return (struct Library *)devBase;
 
-    return (struct Library *)base;
-}
+    /* dead code below — original virtnet HW init, unreachable */
+    devBase->ExpansionBase = iexec->OpenLibrary("expansion.library", 53);
+    if (!devBase->ExpansionBase) {
+        LOGF(log, (CONST_STRPTR)"expansion.library v53 open FAILED - no-hardware mode\n");
+        lo_log_close(iexec, &log);
+        return (struct Library *)devBase;
+    }
+    LOGF(log, (CONST_STRPTR)"expansion.library v53 OK\n");
 
-BPTR _manager_Expunge(struct DeviceManagerInterface *Self)
-{
-    struct LoopbackBase *base = (struct LoopbackBase *)Self->Data.LibBase;
-    struct ExecIFace *IExec = base->IExec;
+    devBase->IPCI = (struct PCIIFace *)iexec->GetInterface(devBase->ExpansionBase,
+                                                            "pci", 1, NULL);
+    if (!devBase->IPCI) {
+        LOGF(log, (CONST_STRPTR)"GetInterface(pci,1) FAILED - no-hardware mode\n");
+        lo_log_close(iexec, &log);
+        return (struct Library *)devBase;
+    }
+    LOGF(log, (CONST_STRPTR)"IPCI v1 acquired\n");
 
-    if (base->dev_Base.dd_Library.lib_OpenCnt) {
-        /* Deferred expunge — mark for later. */
-        base->dev_Base.dd_Library.lib_Flags |= LIBF_DELEXP;
-        return (BPTR)NULL;
+    devBase->pciDevice = devBase->IPCI->FindDeviceTags(
+        FDT_VendorID, VIRTIO_PCI_VENDOR,
+        FDT_DeviceID, VIRTIO_NET_PCI_DEVICE,
+        TAG_END);
+
+    if (!devBase->pciDevice) {
+        LOGF(log, (CONST_STRPTR)"FindDeviceTags(%04lx:%04lx): NOT FOUND - "
+             "add '-device e1000-82540em' to QEMU\n",
+             (ULONG)VIRTIO_PCI_VENDOR, (ULONG)VIRTIO_NET_PCI_DEVICE);
+        lo_log_close(iexec, &log);
+        return (struct Library *)devBase;
     }
 
-    if (base->unit_task) {
-        IExec->Signal(base->unit_task, SIGBREAKF_CTRL_C);
-        /* Give the task time to exit — simple wait via TimerDevice
-         * would be cleaner but adds a dependency; brief spin is fine
-         * because the task is at pri 20 and will preempt us. */
-        for (int i = 0; i < 100 && base->unit_task &&
-             (base->unit_task->tc_State != TS_INVALID); i++) {
-            IExec->Wait(0);   /* yield once per iteration */
+    {
+        uint8 bus = 0, dev = 0, fn = 0;
+        devBase->pciDevice->GetAddress(&bus, &dev, &fn);
+        LOGF(log, (CONST_STRPTR)"FindDeviceTags(%04lx:%04lx): FOUND at PCI %02lx:%02lx.%lu\n",
+             (ULONG)VIRTIO_PCI_VENDOR, (ULONG)VIRTIO_NET_PCI_DEVICE,
+             (ULONG)bus, (ULONG)dev, (ULONG)fn);
+    }
+
+    /* -------- Phase 3c: dump PCI config space ----------
+     * All READS. Safe. Values verified against the QEMU e1000 emulation:
+     *   vendor=8086, device=100E, class=0200 (Ethernet), rev=03.
+     * Command should have MEM_SPACE=1 and BUS_MASTER=1 for the driver to
+     * function. If BUS_MASTER isn't set yet we'll turn it on in Phase 3e
+     * before touching descriptor rings. */
+    {
+        struct PCIDevice *pd = devBase->pciDevice;
+        UWORD vendor  = pd->ReadConfigWord(PCI_VENDOR_ID);
+        UWORD devid   = pd->ReadConfigWord(PCI_DEVICE_ID);
+        UWORD cmd     = pd->ReadConfigWord(PCI_COMMAND);
+        UWORD stat    = pd->ReadConfigWord(PCI_STATUS);
+        UBYTE rev     = pd->ReadConfigByte(PCI_REVISION_ID);
+        UBYTE clsprog = pd->ReadConfigByte(PCI_CLASS_PROG);
+        UBYTE clsdev  = pd->ReadConfigByte(PCI_CLASS_DEVICE);
+        UBYTE intline = pd->ReadConfigByte(PCI_INTERRUPT_LINE);
+        UBYTE intpin  = pd->ReadConfigByte(PCI_INTERRUPT_PIN);
+        ULONG bar0raw = pd->ReadConfigLong(PCI_BASE_ADDRESS_0);
+
+        LOGF(log, (CONST_STRPTR)"config: vendor=%04lx device=%04lx rev=%02lx class=%02lx.%02lx\n",
+             (ULONG)vendor, (ULONG)devid, (ULONG)rev, (ULONG)clsdev, (ULONG)clsprog);
+        LOGF(log, (CONST_STRPTR)"config: command=%04lx status=%04lx\n",
+             (ULONG)cmd, (ULONG)stat);
+        LOGF(log, (CONST_STRPTR)"config: interrupt line=%lu pin=%lu\n",
+             (ULONG)intline, (ULONG)intpin);
+        LOGF(log, (CONST_STRPTR)"config: BAR0 raw=%08lx  (type=%s, prefetch=%s)\n",
+             (ULONG)bar0raw,
+             (bar0raw & 1) ? (CONST_STRPTR)"IO" : (CONST_STRPTR)"MEM",
+             (bar0raw & 8) ? (CONST_STRPTR)"yes" : (CONST_STRPTR)"no");
+    }
+
+    /* -------- Phase 10a: virtio BAR0 (I/O port) ----------
+     * Legacy virtio devices expose their control registers via an
+     * I/O port BAR (BAR0, bit0 set). We extract the port base by
+     * reading the raw BAR value and masking off the low 2 bits (I/O
+     * space indicator + reserved). Register accesses go through
+     * IPCI->InByte/OutByte etc. which handle the PPC → PCI I/O
+     * translation and the little-endian byte-swap for us. */
+    {
+        ULONG bar0raw = devBase->pciDevice->ReadConfigLong(PCI_BASE_ADDRESS_0);
+        if (!(bar0raw & 1)) {
+            LOGF(log, (CONST_STRPTR)"BAR0 is MEM not IO — virtio-modern-only device? aborting Init\n");
+            lo_log_close(iexec, &log);
+            return (struct Library *)devBase;
+        }
+        devBase->io_base = bar0raw & ~0x03UL;
+        LOGF(log, (CONST_STRPTR)"virtio: io_base=%08lx\n", (ULONG)devBase->io_base);
+    }
+
+    /* Ensure BUS_MASTER + IO_SPACE are enabled in PCI command. QEMU
+     * usually pre-sets these but be defensive — a cold reset may
+     * clear BUS_MASTER. */
+    {
+        UWORD cmd = devBase->pciDevice->ReadConfigWord(PCI_COMMAND);
+        UWORD want = cmd | 0x0005;   /* IO_SPACE=1 | BUS_MASTER=4 */
+        if (want != cmd) {
+            devBase->pciDevice->WriteConfigWord(PCI_COMMAND, want);
+            LOGF(log, (CONST_STRPTR)"pci cmd: %04lx -> %04lx (enabling IO+bus-master)\n",
+                 (ULONG)cmd, (ULONG)want);
         }
     }
-    if (base->begin_port) {
-        IExec->FreeSysObject(ASOT_PORT, base->begin_port);
-        base->begin_port = NULL;
+
+    /* -------- Phase 10b: virtio init handshake ----------
+     * Per virtio 0.9.5 §3.1.1: RESET → ACK → DRIVER → feature
+     * negotiate → FEATURES_OK → queue setup → DRIVER_OK. Here we
+     * do RESET+ACK+DRIVER + feature negotiate. Queue setup and
+     * DRIVER_OK are Phase 10c/d, coming next. */
+    if (!virtio_reset_and_ack(devBase)) {
+        LOGF(log, (CONST_STRPTR)"virtio: reset/ack FAILED — device signaled FAILED\n");
+        lo_log_close(iexec, &log);
+        return (struct Library *)devBase;
     }
-    if (base->IUtility) {
-        IExec->DropInterface((struct Interface *)base->IUtility);
-        base->IUtility = NULL;
+    LOGF(log, (CONST_STRPTR)"virtio: reset OK, status=%02lx\n",
+         (ULONG)virtio_read_status(devBase));
+
+    /* Negotiate ONLY the features we actually implement. Keep the
+     * subset minimal for the first cut:
+     *   - VIRTIO_NET_F_MAC   : device provides MAC via config space
+     *   - VIRTIO_NET_F_STATUS: device advertises link status
+     * Explicitly REJECT VIRTIO_NET_F_MRG_RXBUF (keeps the packet
+     * header at 10 bytes not 12) and all GSO / TSO / checksum-
+     * offload variants (we do plain copies, no HW offload support). */
+    /* Also request VIRTIO_F_ANY_LAYOUT — this tells the device we
+     * can pack the virtio_net_hdr and the Ethernet frame into a
+     * SINGLE descriptor (as we do). Without it, TX must be a 2-
+     * descriptor chain (header + frame linked via NEXT flag) and
+     * QEMU rejects a single-descriptor TX with "bogus descriptor
+     * or out of resources". */
+    /* Drop VIRTIO_NET_F_MRG_RXBUF — it grows virtio_net_hdr from 10
+     * to 12 bytes and we haven't updated VIRTIO_NET_HDR_LEN or the
+     * TX packet layout accordingly. Any-layout stays so we can use
+     * single-descriptor TX. */
+    /* Phase 13c: also try VIRTIO_NET_F_CSUM. QEMU will L4-checksum
+     * for us if we set VIRTIO_NET_HDR_F_NEEDS_CSUM per packet plus
+     * csum_start / csum_offset. Roadshow doesn't have a "skip
+     * checksum" knob, but CMD_WRITE below zeros the L4 checksum
+     * after copy so QEMU's overwrite is the source of truth — no
+     * double-work-plus-wrong-value risk.
+     *
+     * Phase 13d: also try VIRTIO_F_RING_EVENT_IDX. Under this
+     * feature the driver writes a per-queue used_event value at the
+     * tail of the avail ring, and the device only interrupts when
+     * its used->idx crosses that value. Setting TX used_event to
+     * an unreachable value (0xFFFF) suppresses TX-completion IRQs
+     * entirely — we already reply-and-forget so completions carry
+     * no information for us. */
+    ULONG want_feat = VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS
+                    | VIRTIO_F_ANY_LAYOUT | VIRTIO_NET_F_CSUM
+                    | VIRTIO_F_RING_EVENT_IDX;
+    virtio_negotiate_features(devBase, want_feat);
+    LOGF(log, (CONST_STRPTR)"virtio: device_features=%08lx driver_wants=%08lx accepted=%08lx\n",
+         (ULONG)devBase->device_features, (ULONG)want_feat,
+         (ULONG)devBase->driver_features);
+
+    /* Discover queue sizes. Legacy virtio-net has two mandatory
+     * queues: 0=RX, 1=TX. Queue 2 is CTRL_VQ, only present if we
+     * negotiated VIRTIO_NET_F_CTRL_VQ (we didn't, so skip). */
+    devBase->rx_vring_num = virtio_queue_num(devBase, VIRTIO_NET_Q_RX);
+    devBase->tx_vring_num = virtio_queue_num(devBase, VIRTIO_NET_Q_TX);
+    LOGF(log, (CONST_STRPTR)"virtio queues: RX num=%lu, TX num=%lu\n",
+         (ULONG)devBase->rx_vring_num, (ULONG)devBase->tx_vring_num);
+
+    /* -------- Phase 10c: read MAC from device config ----------
+     * With VIRTIO_NET_F_MAC negotiated, bytes 0..5 of the device-
+     * specific config region (offset 0x14 from BAR0 when no MSI-X)
+     * hold the primary MAC. QEMU pre-fills from the -device mac=
+     * option; default 52:54:00:12:34:5x. */
+    if (devBase->driver_features & VIRTIO_NET_F_MAC) {
+        for (int i = 0; i < 6; i++) {
+            devBase->mac[i] = virtio_read_dev_cfg8(devBase, i);
+        }
+        LOGF(log, (CONST_STRPTR)"MAC         = %02lx:%02lx:%02lx:%02lx:%02lx:%02lx\n",
+             (ULONG)devBase->mac[0], (ULONG)devBase->mac[1], (ULONG)devBase->mac[2],
+             (ULONG)devBase->mac[3], (ULONG)devBase->mac[4], (ULONG)devBase->mac[5]);
+    } else {
+        LOGF(log, (CONST_STRPTR)"virtio: no MAC feature — device didn't provide MAC\n");
+        /* Fake a MAC so the driver doesn't crash on GETSTATIONADDRESS.
+         * Real fix: fail Init instead. */
+        for (int i = 0; i < 6; i++) devBase->mac[i] = 0;
     }
-    if (base->UtilityBase) {
-        IExec->CloseLibrary(base->UtilityBase);
-        base->UtilityBase = NULL;
+    /* Optional: read link status if VIRTIO_NET_F_STATUS negotiated.
+     * Status is 2 bytes at cfg offset 6. */
+    if (devBase->driver_features & VIRTIO_NET_F_STATUS) {
+        /* virtio-net status is 2 bytes at cfg offset 6. Empirically
+         * with QEMU's virtio-net-pci on PPC BE: memory contains
+         * bytes [0x00, 0x01] for LINK_UP — i.e. guest-native BIG-
+         * endian encoding, not the little-endian we'd expect from
+         * the standard registers. Legacy virtio spec explicitly says
+         * device-specific config uses guest-native endianness. */
+        UBYTE b6 = virtio_read_dev_cfg8(devBase, 6);
+        UBYTE b7 = virtio_read_dev_cfg8(devBase, 7);
+        UWORD link = ((UWORD)b6 << 8) | b7;   /* BE decode */
+        LOGF(log, (CONST_STRPTR)"virtio link status: bytes=%02lx,%02lx link=%04lx (%s)\n",
+             (ULONG)b6, (ULONG)b7, (ULONG)link,
+             (link & VIRTIO_NET_S_LINK_UP) ? (CONST_STRPTR)"UP" : (CONST_STRPTR)"down");
     }
-    return base->dev_SegList;
+
+    /* All the acquire steps succeeded — flip the flag so BeginIO
+     * dispatch knows S2_DEVICEQUERY / S2_GETSTATIONADDRESS can
+     * answer with real values instead of S2ERR_OUTOFSERVICE. */
+    devBase->hw_present = TRUE;
+
+    /* -------- Phase 10d: allocate virtqueues + publish PFN ----------
+     * One contiguous 4KB-aligned allocation per queue, VRING_TOTAL_BYTES
+     * sized. Zero-init (avail/used idx = 0, all descriptors dead).
+     * Resolve physical address, hand PFN to device. */
+    if (devBase->rx_vring_num == 0 || devBase->tx_vring_num == 0) {
+        LOGF(log, (CONST_STRPTR)"virtio: queue-num was 0 — device rejected setup, aborting\n");
+        lo_log_close(iexec, &log);
+        return (struct Library *)devBase;
+    }
+
+    {
+        ULONG rx_bytes = VRING_TOTAL_BYTES(devBase->rx_vring_num);
+        /* Phase 10j-12: over-allocate tx_vring so a piggy-backed
+         * tx_scratch2 (2 KB) fits after the ring layout, keeping both
+         * in a single AllocVecTags block. */
+        ULONG tx_bytes = VRING_TOTAL_BYTES(devBase->tx_vring_num) + 4096;
+        /* Phase 10j-15: try plain AllocMem(size, MEMF_KICK) instead of
+         * AllocVecTags. rtl8139 uses AllocMem for all its DMA buffers
+         * (3 sites at offset 104). AllocMem has no alignment tag — we
+         * over-allocate by 4KB and manually align. If AllocMem succeeds
+         * where AllocVecTags failed, that's evidence the AVT_* attribute
+         * tags force stricter physical placement than plain MEMF_KICK
+         * needs. */
+        /* Phase 10k FIX-2: AllocVecTags with AVT_Contiguous=TRUE and
+         * AVT_PhysicalAlignment=4096. MEMF_KICK gave us memory but did
+         * NOT guarantee physical contiguity for the full 16KB span —
+         * only page 1's phys was reported to QEMU via PFN; pages 2..4
+         * (avail ring, used ring, tx_scratch) landed at unrelated phys
+         * addresses so QEMU's DMA read of page 2+ hit random memory,
+         * seeing the initial zero-init and never our updated avail->idx.
+         * Symptom: first TX popped (first page had descriptor which was
+         * correctly located); every subsequent TX pushed to avail_ring
+         * which lives on page 2 that QEMU can't read. */
+        ULONG rx_alloc = rx_bytes;
+        ULONG tx_alloc = tx_bytes;
+        APTR rx_raw = iexec->AllocVecTags(rx_alloc,
+            AVT_Type, MEMF_SHARED,
+            AVT_Contiguous, TRUE,
+            AVT_PhysicalAlignment, 4096,
+            AVT_Alignment, 4096,
+            AVT_Clear, TRUE,
+            TAG_END);
+        APTR tx_raw = iexec->AllocVecTags(tx_alloc,
+            AVT_Type, MEMF_SHARED,
+            AVT_Contiguous, TRUE,
+            AVT_PhysicalAlignment, 4096,
+            AVT_Alignment, 4096,
+            AVT_Clear, TRUE,
+            TAG_END);
+        devBase->rx_vring_raw = rx_raw;
+        devBase->tx_vring_raw = tx_raw;
+        devBase->rx_vring_raw_size = rx_alloc;
+        devBase->tx_vring_raw_size = tx_alloc;
+        /* AllocVecTags with 4096 alignment gives us already-aligned
+         * memory — no need for manual round-up (which was pointless
+         * anyway if only the first page's phys was contiguous). */
+        devBase->rx_vring = rx_raw;
+        devBase->tx_vring = tx_raw;
+        /* AVT_Clear=TRUE didn't actually clear when combined with
+         * AVT_Contiguous on this build (empirically: after Expunge/
+         * ReInit cycle we saw the previous instance's populated RX
+         * indices in freshly-"cleared" TX memory). Manual clear via
+         * uint32 stores, no memcpy/memset (would pull newlib into the
+         * resident-tag driver). */
+        if (rx_raw) {
+            volatile uint32 *p = (volatile uint32 *)rx_raw;
+            ULONG w = rx_alloc / 4;
+            for (ULONG i = 0; i < w; i++) p[i] = 0;
+        }
+        if (tx_raw) {
+            volatile uint32 *p = (volatile uint32 *)tx_raw;
+            ULONG w = tx_alloc / 4;
+            for (ULONG i = 0; i < w; i++) p[i] = 0;
+        }
+        if (!devBase->rx_vring || !devBase->tx_vring) {
+            LOGF(log, (CONST_STRPTR)"virtio: vring alloc FAILED (rx=%p tx=%p size rx=%lu tx=%lu)\n",
+                 devBase->rx_vring, devBase->tx_vring,
+                 (ULONG)rx_bytes, (ULONG)tx_bytes);
+            lo_log_close(iexec, &log);
+            return (struct Library *)devBase;
+        }
+        devBase->rx_vring_phys = vn_dma_phys(iexec, devBase->rx_vring, rx_bytes, 0);
+        devBase->tx_vring_phys = vn_dma_phys(iexec, devBase->tx_vring, tx_bytes, DMA_ReadFromRAM);
+
+        /* Phase 10k FIX: mark the vring memory CACHE-INHIBITED. Phases
+         * 10j-1..18 chased a "CPU write not landing in RAM before QEMU
+         * DMA-read" bug for multiple sub-phases. testrawstat proved
+         * CPU-side write+readback of avail->idx sees the value we
+         * wrote, but QEMU virtio_queue_notify fires and virtqueue_pop
+         * NEVER — QEMU's DMA read sees stale RAM. dcbf loops don't
+         * reliably push modified lines out on this platform.
+         *
+         * Solution: bypass the cache entirely for this memory range.
+         * IMMU->SetMemoryAttrs with MEMATTRF_CACHEINHIBIT changes the
+         * PPC page's WIMG bits so all loads/stores go straight to RAM,
+         * no caching, no dcbf ceremony required. Every avail->idx
+         * write is immediately visible to QEMU's DMA. */
+        {
+            struct MMUIFace *IMMU = (struct MMUIFace *)iexec->GetInterface(
+                (struct Library *)iexec->Data.LibBase, "MMU", 1, NULL);
+            if (IMMU) {
+                /* Round up to the next 4KB — PPC MMU pages are 4KB and
+                 * SetMemoryAttrs may otherwise leave the trailing partial
+                 * page cached. Cover the whole allocation so ALL of the
+                 * ring plus piggy-back scratch is uncached. */
+                ULONG rx_ci_len = (rx_bytes + 4095UL) & ~4095UL;
+                ULONG tx_ci_len = (tx_bytes + 4095UL) & ~4095UL;
+                IMMU->SetMemoryAttrs(devBase->rx_vring, rx_ci_len,
+                    MEMATTRF_CACHEINHIBIT | MEMATTRF_GUARDED | MEMATTRF_COHERENT | MEMATTRF_READ_WRITE);
+                IMMU->SetMemoryAttrs(devBase->tx_vring, tx_ci_len,
+                    MEMATTRF_CACHEINHIBIT | MEMATTRF_GUARDED | MEMATTRF_COHERENT | MEMATTRF_READ_WRITE);
+                iexec->DropInterface((struct Interface *)IMMU);
+                LOGF(log, (CONST_STRPTR)"vrings: CACHEINHIBIT rx@%p(%lu) tx@%p(%lu)\n",
+                     devBase->rx_vring, (ULONG)rx_ci_len,
+                     devBase->tx_vring, (ULONG)tx_ci_len);
+            } else {
+                LOGF(log, (CONST_STRPTR)"WARN: MMU interface unavailable; vrings remain cached\n");
+            }
+        }
+
+        LOGF(log, (CONST_STRPTR)"virtio vrings: rx=%p phys=%08lx (%lu bytes)  tx=%p phys=%08lx (%lu bytes)\n",
+             devBase->rx_vring, (ULONG)devBase->rx_vring_phys, (ULONG)rx_bytes,
+             devBase->tx_vring, (ULONG)devBase->tx_vring_phys, (ULONG)tx_bytes);
+        if ((devBase->rx_vring_phys & 0xFFF) != 0 || (devBase->tx_vring_phys & 0xFFF) != 0) {
+            LOGF(log, (CONST_STRPTR)"virtio: vring NOT 4KB-aligned — device will reject PFN\n");
+            lo_log_close(iexec, &log);
+            return (struct Library *)devBase;
+        }
+
+        virtio_set_queue_pfn(devBase, VIRTIO_NET_Q_RX, devBase->rx_vring_phys);
+        /* Readback: what did QEMU actually store? PFN is stored per
+         * currently-selected queue. After the set, QUEUE_SEL is still
+         * VIRTIO_NET_Q_RX so QUEUE_PFN reads the RX PFN back. */
+        {
+            ULONG rx_pfn_read = devBase->pciDevice->InLong(
+                devBase->io_base + VIRTIO_PCI_QUEUE_PFN);
+            ULONG expected = devBase->rx_vring_phys / VRING_ALIGN;
+            LOGF(log, (CONST_STRPTR)"virtio RX PFN: wrote=%08lx readback=%08lx %s\n",
+                 (ULONG)expected, (ULONG)rx_pfn_read,
+                 (expected == rx_pfn_read) ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"MISMATCH");
+        }
+        virtio_set_queue_pfn(devBase, VIRTIO_NET_Q_TX, devBase->tx_vring_phys);
+        {
+            ULONG tx_pfn_read = devBase->pciDevice->InLong(
+                devBase->io_base + VIRTIO_PCI_QUEUE_PFN);
+            ULONG expected = devBase->tx_vring_phys / VRING_ALIGN;
+            LOGF(log, (CONST_STRPTR)"virtio TX PFN: wrote=%08lx readback=%08lx %s\n",
+                 (ULONG)expected, (ULONG)tx_pfn_read,
+                 (expected == tx_pfn_read) ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"MISMATCH");
+        }
+    }
+
+    /* -------- Phase 10d: allocate RX buffer pool + populate avail ring ----
+     * One 2 KB buffer per RX descriptor. Fill each descriptor:
+     *   addr_lo = buffer's PCI-bus phys addr
+     *   addr_hi = 0 (we're 32-bit)
+     *   len     = 2048
+     *   flags   = VRING_DESC_F_WRITE  (device-writable)
+     *   next    = 0
+     * Then push every descriptor index onto avail->ring so the device
+     * has all 256 slots ready to receive. */
+    {
+        ULONG num = devBase->rx_vring_num;
+        ULONG pool_bytes = num * VN_RX_BUFSIZE;
+        /* Phase 10j-15: plain AllocMem for the 512 KB RX pool. Same path
+         * that succeeded for the rings. MEMF_SHARED (no KICK) since
+         * KICK region is too small for 512 KB. AllocMem returns 16-byte
+         * aligned by contract, sufficient for VRING descriptor addr. */
+        devBase->rx_bufs = iexec->AllocMem(pool_bytes, MEMF_SHARED | MEMF_CLEAR);
+        if (!devBase->rx_bufs) {
+            LOGF(log, (CONST_STRPTR)"virtio: rx_bufs alloc FAILED (%lu bytes)\n",
+                 (ULONG)pool_bytes);
+            lo_log_close(iexec, &log);
+            return (struct Library *)devBase;
+        }
+        devBase->rx_bufs_phys = vn_dma_phys(iexec, devBase->rx_bufs, pool_bytes, 0);
+        LOGF(log, (CONST_STRPTR)"virtio rx_bufs: cpu=%p phys=%08lx pool=%lu\n",
+             devBase->rx_bufs, (ULONG)devBase->rx_bufs_phys, (ULONG)pool_bytes);
+
+        /* Populate descriptor table. All ring fields are stored in
+         * LITTLE-ENDIAN — QEMU's transitional virtio-net-pci reads
+         * ring memory LE regardless of guest endianness. Use the
+         * vio_le*_put helpers so PPC BE writes byte-swap correctly. */
+        struct vring_desc *desc = (struct vring_desc *)devBase->rx_vring;
+        for (ULONG i = 0; i < num; i++) {
+            vio_le32_put(&desc[i].addr_lo, devBase->rx_bufs_phys + (i * VN_RX_BUFSIZE));
+            vio_le32_put(&desc[i].addr_hi, 0);
+            vio_le32_put(&desc[i].len, VN_RX_BUFSIZE);
+            vio_le16_put(&desc[i].flags, VRING_DESC_F_WRITE);
+            vio_le16_put(&desc[i].next, 0);
+        }
+        /* RESTORED: populate avail ring with all 256 slots. Phase 10j
+         * isolation test confirmed error is TX-side, not RX. */
+        UBYTE *avail_bytes = ((UBYTE *)devBase->rx_vring) + VRING_AVAIL_OFFSET(num);
+        struct vring_avail_header *avail = (struct vring_avail_header *)avail_bytes;
+        uint16 *avail_ring = (uint16 *)(avail_bytes + 4);
+        vio_le16_put(&avail->flags, 0);
+        for (ULONG i = 0; i < num; i++) {
+            vio_le16_put(&avail_ring[i], (uint16)i);
+        }
+        __asm__ volatile ("eieio; sync" : : : "memory");
+        vio_le16_put(&avail->idx, (uint16)num);
+        __asm__ volatile ("eieio; sync" : : : "memory");
+
+        devBase->rx_next_avail = (UWORD)num;
+        devBase->rx_last_used  = 0;
+    }
+
+    /* -------- Phase 10f: TX scratch buffer ----------
+     * Single buffer big enough for one virtio_net_hdr + max Ethernet
+     * frame (1514 bytes payload including header + 10-byte hdr = 1524).
+     * Round to 2 KB for cache-line safety. All TX packets use this
+     * single buffer + descriptor 0, serialized by the SANA-II dispatch
+     * layer. */
+
+    /* -------- Phase 13d: EVENT_IDX initial setting ----------
+     * If VIRTIO_F_RING_EVENT_IDX was negotiated, set the TX avail
+     * ring's used_event to 0xFFFF so the device NEVER interrupts on
+     * TX completion — we reply-and-forget from CMD_WRITE so
+     * completion notifications carry zero information. Suppressing
+     * these saves one IRQ + task-wake per packet transmitted.
+     *
+     * RX avail's used_event stays at 0 (get an IRQ on the very
+     * first packet). lo_process_rx will bump it after each pass. */
+    if (devBase->driver_features & VIRTIO_F_RING_EVENT_IDX) {
+        UWORD tnum = devBase->tx_vring_num;
+        UBYTE *tavail = ((UBYTE *)devBase->tx_vring) + VRING_AVAIL_OFFSET(tnum);
+        /* used_event sits right after the ring[] array: offset
+         * 4 (header) + 2*num (ring). */
+        uint16 *tx_used_event = (uint16 *)(tavail + 4 + 2 * tnum);
+        vio_le16_put(tx_used_event, (uint16)0xFFFF);
+        LOGF(log, (CONST_STRPTR)"EVENT_IDX: TX used_event=0xFFFF (suppress TX-completion IRQs)\n");
+    }
+
+    {
+        /* Phase 10j-16: PIGGYBACK tx_scratch2 inside tx_vring's tail.
+         *
+         * We over-allocated tx_vring by 4 KB precisely for this. QEMU
+         * has demonstrably read descriptors from tx_vring (virtqueue_pop
+         * fires successfully), so we know that alloc is DMA-visible.
+         * Separate AllocMem'd blocks — even with identical MEMF_KICK
+         * flags — showed zeros when QEMU followed a descriptor addr
+         * into them. Reusing tx_vring's known-good region guarantees
+         * QEMU can DMA-read the packet payload. */
+        ULONG scratch_offset = VRING_TOTAL_BYTES(devBase->tx_vring_num);
+        scratch_offset = (scratch_offset + 31) & ~31UL;
+        devBase->tx_scratch2 = (APTR)((UBYTE *)devBase->tx_vring + scratch_offset);
+        devBase->tx_scratch2_phys = devBase->tx_vring_phys + scratch_offset;
+        if (!devBase->tx_scratch2) {
+            LOGF(log, (CONST_STRPTR)"virtio: tx_scratch2 (MEMF_KICK) alloc FAILED\n");
+            lo_log_close(iexec, &log);
+            return (struct Library *)devBase;
+        }
+        /* DO NOT re-derive phys via vn_dma_phys — tx_scratch2 lives
+         * inside tx_vring's already-StartDMA'd range; a second
+         * StartDMA on overlapping memory returns 0, blanking the
+         * phys we computed correctly by arithmetic above. Just log. */
+        LOGF(log, (CONST_STRPTR)"virtio tx_scratch2 (piggyback): cpu=%p phys=%08lx\n",
+             devBase->tx_scratch2, (ULONG)devBase->tx_scratch2_phys);
+
+        /* Verify with IMMU that CPU phys matches DMA phys. */
+        struct MMUIFace *IMMU = (struct MMUIFace *)iexec->GetInterface(
+            (struct Library *)((struct ExecBase *)iexec->Data.LibBase),
+            "mmu", 1, NULL);
+        if (IMMU) {
+            APTR cpu_phys_scratch = IMMU->GetPhysicalAddress(devBase->tx_scratch2);
+            LOGF(log, (CONST_STRPTR)"IMMU: tx_scratch2 cpu_phys=%p (dma_phys=%08lx)\n",
+                 cpu_phys_scratch, (ULONG)devBase->tx_scratch2_phys);
+            iexec->DropInterface((struct Interface *)IMMU);
+        }
+    }
+
+    /* -------- Phase 13b: TX scratch pool ----------
+     * Separate allocation of VN_TX_POOL_SLOTS × VN_TX_SLOT_SIZE. Same
+     * AllocMem(MEMF_SHARED|MEMF_CLEAR) pattern that already works for
+     * the RX buffer pool — QEMU DMA-reads land in the same physical
+     * pages the CPU wrote. CMD_WRITE later picks pool[desc_slot % N]
+     * so back-to-back TX from Roadshow can't overwrite an in-flight
+     * slot's buffer. */
+    {
+        ULONG tx_pool_bytes = VN_TX_POOL_SLOTS * VN_TX_SLOT_SIZE;
+        devBase->tx_pool = iexec->AllocMem(tx_pool_bytes, MEMF_SHARED | MEMF_CLEAR);
+        if (!devBase->tx_pool) {
+            LOGF(log, (CONST_STRPTR)"virtio: tx_pool alloc FAILED (%lu bytes)\n",
+                 (ULONG)tx_pool_bytes);
+            lo_log_close(iexec, &log);
+            return (struct Library *)devBase;
+        }
+        devBase->tx_pool_phys  = vn_dma_phys(iexec, devBase->tx_pool, tx_pool_bytes, DMA_ReadFromRAM);
+        devBase->tx_pool_slots = (UWORD)VN_TX_POOL_SLOTS;
+        LOGF(log, (CONST_STRPTR)"virtio tx_pool: cpu=%p phys=%08lx slots=%lu size=%lu\n",
+             devBase->tx_pool, (ULONG)devBase->tx_pool_phys,
+             (ULONG)VN_TX_POOL_SLOTS, (ULONG)tx_pool_bytes);
+    }
+
+    /* -------- Phase 10e: install IRQ + flip DRIVER_OK ----------
+     * The device may start writing to our RX ring the moment we set
+     * DRIVER_OK, so install the IRQ handler FIRST. Existing vn_isr
+     * from the virte1000 fork reads e1000 ICR — we'd need to replace
+     * that read with a virtio ISR read for actual RX to work, but
+     * even the stub is enough to keep the vector claimed. */
+    if (devBase->pciDevice) {
+        devBase->irq_vector = devBase->pciDevice->MapInterrupt();
+        LOGF(log, (CONST_STRPTR)"MapInterrupt: vector=%lu\n", devBase->irq_vector);
+        if (devBase->irq_vector != 0) {
+            devBase->irq_node.is_Node.ln_Type = NT_INTERRUPT;
+            devBase->irq_node.is_Node.ln_Pri  = 0;
+            devBase->irq_node.is_Node.ln_Name = (STRPTR)DEVNAME;
+            devBase->irq_node.is_Data         = (APTR)devBase;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-function-type"
+            devBase->irq_node.is_Code = (VOID (*)())vn_isr;
+#pragma GCC diagnostic pop
+            BOOL ok = iexec->AddIntServer(devBase->irq_vector, &devBase->irq_node);
+            devBase->irq_installed = ok;
+            LOGF(log, (CONST_STRPTR)"AddIntServer: vec=%lu result=%s\n",
+                 devBase->irq_vector, ok ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"FAILED");
+        }
+    }
+
+    /* PHASE 10j FINDING: with DRIVER_OK skipped, QEMU never emits
+     * "bogus descriptor" — confirming the error is triggered by ring
+     * processing post-DRIVER_OK (specifically, our TX notify or
+     * QEMU's RX-pop at driver-up time). Re-enable DRIVER_OK now that
+     * we know where the trigger lives. */
+    virtio_driver_ok(devBase);
+    LOGF(log, (CONST_STRPTR)"virtio: DRIVER_OK set, status=%02lx (device may now use queues)\n",
+         (ULONG)virtio_read_status(devBase));
+
+    /* Phase 6k/l: unit task processes queued CMD_READ on ISR signal.
+     * PHASE 7q: task ALSO creates its own begin_port + waits on it —
+     * BeginIO PutMsg's ioreqs there for the task to dispatch. Port
+     * MUST be created inside the task because signals are per-task. */
+    BOOL task_ok = lo_task_start(devBase, iexec);
+    LOGF(log, (CONST_STRPTR)"unit task: %s (task=%p mask=%08lx begin_port=%p)\n",
+         task_ok ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"FAILED",
+         devBase->unit_task, (ULONG)devBase->unit_signal_mask,
+         devBase->begin_port);
+
+    /* State starts OFFLINE — caller must invoke S2_CONFIGINTERFACE then
+     * S2_ONLINE (or the debug VN_DBG_FIRE_IRQ, once online) to make
+     * the device live. */
+    LOGF(log, (CONST_STRPTR)"Init done: state=OFFLINE (need S2_CONFIGINTERFACE + S2_ONLINE)\n");
+
+    lo_log_close(iexec, &log);
+    return (struct Library *)devBase;
 }
 
 struct LoopbackBase *_manager_Open(struct DeviceManagerInterface *Self,
-                                     struct IOSana2Req *ioreq,
-                                     ULONG unitNum, ULONG flags)
+                                    struct IOSana2Req *ioreq,
+                                    ULONG unitNum, ULONG flags)
 {
+    struct LoopbackBase *devBase = (struct LoopbackBase *)Self->Data.LibBase;
     (void)flags;
-    struct LoopbackBase *base = (struct LoopbackBase *)Self->Data.LibBase;
-    struct ExecIFace *IExec = base->IExec;
 
-    /* Tracer: proves Open was entered. Readable via LO_DBG_STATUS
-     * (packets_tx slot). Also written from another task via teststat
-     * won't clobber this because BeginIO for DBG cmds is fast-path
-     * synchronous — no interleaving. */
-    base->packets_tx = 0xDEADBEEF;
+    devBase->dev_Base.dd_Library.lib_OpenCnt++;
 
-    IExec->ObtainSemaphore(&base->io_lock);
-    base->packets_tx = 0xCAFEBABE;   /* passed ObtainSemaphore */
-    base->dev_Base.dd_Library.lib_OpenCnt++;
-
+    /* Phase-1: only unit 0 is meaningful (single-NIC), but there is no
+     * hardware behind it yet. Accept the open so the test app can
+     * exercise the shell, then immediately treat BeginIO as no-op. */
     if (unitNum != 0) {
-        ioreq->ios2_Req.io_Error  = IOERR_OPENFAIL;
+        ioreq->ios2_Req.io_Error = IOERR_OPENFAIL;
         ioreq->ios2_Req.io_Unit   = (struct Unit *)-1;
         ioreq->ios2_Req.io_Device = (struct Device *)-1;
-        base->dev_Base.dd_Library.lib_OpenCnt--;
-        IExec->ReleaseSemaphore(&base->io_lock);
+        devBase->dev_Base.dd_Library.lib_OpenCnt--;
         return NULL;
     }
 
-    ioreq->ios2_Req.io_Unit   = &base->lo_unit;
-    ioreq->ios2_Req.io_Device = (struct Device *)base;
+    /* Phase 6d: hand out the real unit pointer so exec's async-path
+     * dispatch finds a valid MsgPort. Increment unit_OpenCnt to mirror
+     * lib_OpenCnt so exec sees the unit as actively used. */
+    ioreq->ios2_Req.io_Unit   = &devBase->lo_unit;
     ioreq->ios2_Req.io_Error  = 0;
+    /* Phase 7a (per pa6t_eth): mark the message as replied so exec's
+     * subsequent SendIO/DoIO on this ioreq sees the reply-state and
+     * short-circuits any pending-queue check. pa6t sets this ONLY on
+     * Open success. An earlier commit bundled this with a crashy
+     * auto-online-in-CONFIGINTERFACE change; that was reverted, but
+     * the NT_REPLYMSG line went with it. Re-adding it in isolation. */
     ioreq->ios2_Req.io_Message.mn_Node.ln_Type = NT_REPLYMSG;
-    base->lo_unit.unit_OpenCnt++;
-    base->dev_Base.dd_Library.lib_Flags &= ~LIBF_DELEXP;
+    devBase->lo_unit.unit_OpenCnt++;
+    devBase->dev_Base.dd_Library.lib_Flags &= ~LIBF_DELEXP;
 
-    struct LoOpener *op = (struct LoOpener *)IExec->AllocVecTags(
+    /* -------- Phase 6j-1: per-opener state ----------
+     * Allocate a LoOpener for this Open. Parse ios2_BufferManagement
+     * (SANA-II Rev 4 tag list) for S2_CopyFromBuff and S2_CopyToBuff —
+     * the caller-supplied function pointers we'll invoke via
+     * IUtility->CallHookPkt on TX and RX. NULL is fine (RAW-only
+     * clients like testtx don't set them). */
+    struct LoOpener *op = (struct LoOpener *)devBase->IExec->AllocVecTags(
         sizeof(struct LoOpener),
         AVT_Type,           MEMF_SHARED,
         AVT_ClearWithValue, 0,
         TAG_END);
-    if (op) {
-        IExec->NewList((struct List *)&op->read_queue);
-        IExec->NewList((struct List *)&op->event_queue);
-
+    if (!op) {
+        /* Non-fatal for legacy RAW-only callers, but flag the error field
+         * to signal the caller that cooked-mode won't work. */
+        devBase->IExec->DebugPrintF("[loopback] Open: opener alloc failed\n");
+        /* Continue anyway — testopen etc. don't rely on opener state. */
+    } else {
+        /* Roadshow (observed empirically via cmdlog): treats
+         * ios2_BufferManagement as an INPUT-ONLY cookie. Roadshow
+         * saves the tag list pointer it passed at OpenDevice and
+         * re-sends that SAME pointer on every subsequent IORequest.
+         * It does NOT read back a driver-rewritten cookie. So we
+         * keep op->bm_cookie = the tag list pointer (matches what
+         * subsequent BeginIO calls pass) and DO NOT overwrite
+         * ios2_BufferManagement. An earlier version of this driver
+         * rewrote it to point at our LoOpener, and every
+         * subsequent CMD_READ/S2_BROADCAST lookup failed because
+         * Roadshow kept sending its original tag list pointer. */
         struct TagItem *tags = (struct TagItem *)ioreq->ios2_BufferManagement;
-        if (tags && base->IUtility) {
-            op->copy_to_buff = (APTR)base->IUtility->GetTagData(S2_CopyToBuff32, 0, tags);
-            op->copy_to_tag  = op->copy_to_buff ? S2_CopyToBuff32 : 0;
+        if (tags && devBase->IUtility) {
+            /* Roadshow can supply hook pointers for either the plain
+             * S2_CopyToBuff / S2_CopyFromBuff (byte-oriented) OR the
+             * 32-bit-aligned variants (S2_CopyToBuff32 etc). It always
+             * supplies AT LEAST ONE. We treat them all the same at the
+             * call site — CallHookPkt hands off a byte pointer, and
+             * Roadshow's hooks internally cope with either alignment.
+             * Falling back through the variants means we can bind to
+             * a Roadshow that only provides the 32/16-bit forms. */
+            /* Prefer the OS4 Hook-style variants (S2_CopyToBuff32 / 16
+             * -- SANA2CopyHookMsg via CallHookPkt) over the classic
+             * Rev 4 S2_CopyToBuff (68k asm fn ptr via EmulateTags).
+             * Roadshow supplies at least one; when it supplies both,
+             * calling the classic one as a Hook* is what put us at
+             * DSI 0x01855a0c on first RX delivery. */
+            op->copy_to_buff = (APTR)devBase->IUtility->GetTagData(
+                S2_CopyToBuff32, 0, tags);
+            op->copy_to_tag = op->copy_to_buff ? S2_CopyToBuff32 : 0;
             if (!op->copy_to_buff) {
-                op->copy_to_buff = (APTR)base->IUtility->GetTagData(S2_CopyToBuff16, 0, tags);
-                op->copy_to_tag  = op->copy_to_buff ? S2_CopyToBuff16 : 0;
+                op->copy_to_buff = (APTR)devBase->IUtility->GetTagData(
+                    S2_CopyToBuff16, 0, tags);
+                op->copy_to_tag = op->copy_to_buff ? S2_CopyToBuff16 : 0;
             }
             if (!op->copy_to_buff) {
-                op->copy_to_buff = (APTR)base->IUtility->GetTagData(S2_CopyToBuff, 0, tags);
-                op->copy_to_tag  = op->copy_to_buff ? S2_CopyToBuff : 0;
+                op->copy_to_buff = (APTR)devBase->IUtility->GetTagData(
+                    S2_CopyToBuff, 0, tags);
+                op->copy_to_tag = op->copy_to_buff ? S2_CopyToBuff : 0;
             }
-            op->copy_from_buff = (APTR)base->IUtility->GetTagData(S2_CopyFromBuff32, 0, tags);
-            op->copy_from_tag  = op->copy_from_buff ? S2_CopyFromBuff32 : 0;
+
+            op->copy_from_buff = (APTR)devBase->IUtility->GetTagData(
+                S2_CopyFromBuff32, 0, tags);
+            op->copy_from_tag = op->copy_from_buff ? S2_CopyFromBuff32 : 0;
             if (!op->copy_from_buff) {
-                op->copy_from_buff = (APTR)base->IUtility->GetTagData(S2_CopyFromBuff16, 0, tags);
-                op->copy_from_tag  = op->copy_from_buff ? S2_CopyFromBuff16 : 0;
+                op->copy_from_buff = (APTR)devBase->IUtility->GetTagData(
+                    S2_CopyFromBuff16, 0, tags);
+                op->copy_from_tag = op->copy_from_buff ? S2_CopyFromBuff16 : 0;
             }
             if (!op->copy_from_buff) {
-                op->copy_from_buff = (APTR)base->IUtility->GetTagData(S2_CopyFromBuff, 0, tags);
-                op->copy_from_tag  = op->copy_from_buff ? S2_CopyFromBuff : 0;
+                op->copy_from_buff = (APTR)devBase->IUtility->GetTagData(
+                    S2_CopyFromBuff, 0, tags);
+                op->copy_from_tag = op->copy_from_buff ? S2_CopyFromBuff : 0;
             }
+
+            devBase->IExec->DebugPrintF(
+                "[loopback] Open: copy_to=%p tag=0x%08lx  copy_from=%p tag=0x%08lx\n",
+                op->copy_to_buff, (unsigned long)op->copy_to_tag,
+                op->copy_from_buff, (unsigned long)op->copy_from_tag);
         }
-        op->bm_cookie = ioreq->ios2_BufferManagement;
-
-        IExec->ObtainSemaphore(&base->opener_lock);
-        IExec->AddTail((struct List *)&base->opener_list, (struct Node *)&op->node);
-        IExec->ReleaseSemaphore(&base->opener_lock);
-
-        ioreq->ios2_BufferManagement = (APTR)op;
+        op->bm_cookie = ioreq->ios2_BufferManagement;   /* the tag list */
+        devBase->IExec->NewList((struct List *)&op->read_queue);
+        devBase->IExec->NewList((struct List *)&op->event_queue);
+        devBase->IExec->ObtainSemaphore(&devBase->opener_lock);
+        devBase->IExec->AddTail((struct List *)&devBase->opener_list,
+                                 (struct Node *)&op->node);
+        devBase->IExec->ReleaseSemaphore(&devBase->opener_lock);
     }
 
-    IExec->ReleaseSemaphore(&base->io_lock);
-    return base;
+    return devBase;
 }
 
-/* Original Open body — disabled while we debug the load-crash. */
 BPTR _manager_Close(struct DeviceManagerInterface *Self, struct IOSana2Req *ioreq)
 {
-    struct LoopbackBase *base = (struct LoopbackBase *)Self->Data.LibBase;
-    struct ExecIFace *IExec = base->IExec;
+    struct LoopbackBase *devBase = (struct LoopbackBase *)Self->Data.LibBase;
+    BPTR seglist = (BPTR)NULL;
 
-    IExec->ObtainSemaphore(&base->io_lock);
-    struct LoOpener *op = (struct LoOpener *)ioreq->ios2_BufferManagement;
-    if (op) {
-        IExec->ObtainSemaphore(&base->opener_lock);
-        IExec->Remove((struct Node *)&op->node);
-        IExec->ReleaseSemaphore(&base->opener_lock);
-        IExec->FreeVec(op);
+    /* Find + remove this caller's Opener from the list. Matching by
+     * bm_cookie — since Phase 7a's BM-cookie rewrite, cookie is now
+     * a pointer to the opener itself (self-referential). Roadshow
+     * calls CloseDevice with the same cookie it received at Open.
+     *
+     * CRITICAL: drain the opener's read_queue BEFORE freeing. Roadshow
+     * (and any well-behaved caller) is supposed to AbortIO its pending
+     * requests first, but if any survive to Close, we MUST reply them
+     * — otherwise the caller's WaitIO deadlocks forever and their
+     * request memory leaks. Reply with IOERR_ABORTED, same as if
+     * AbortIO had been called. Also removes the opener from the
+     * driver-side list atomically so the unit_task's process_rx
+     * doesn't race and try to deliver into a freed opener. */
+    {
+        struct ExecIFace *IExec = devBase->IExec;
+        struct LoOpener *op, *found = NULL;
+        APTR cookie = ioreq->ios2_BufferManagement;
+        IExec->ObtainSemaphore(&devBase->opener_lock);
+        for (op = (struct LoOpener *)devBase->opener_list.mlh_Head;
+             op->node.mln_Succ;
+             op = (struct LoOpener *)op->node.mln_Succ) {
+            if (op->bm_cookie == cookie) { found = op; break; }
+        }
+        if (found) {
+            /* Drain queued CMD_READs while still holding opener_lock —
+             * this locks out process_rx from adding/removing anything.
+             * A Node is at offset 0 of IOSana2Req (through io_Message
+             * at offset 0 of ios2_Req at offset 0), so cast directly. */
+            struct Node *node;
+            while ((node = IExec->RemHead(
+                        (struct List *)&found->read_queue)) != NULL) {
+                struct IOSana2Req *pending = (struct IOSana2Req *)node;
+                pending->ios2_Req.io_Error = IOERR_ABORTED;
+                IExec->ReplyMsg((struct Message *)pending);
+            }
+            /* Phase 7a: drain event_queue too — S2_ONEVENT requests
+             * that never fired need to be replied to before we free
+             * the opener, else the caller's WaitIO deadlocks. */
+            while ((node = IExec->RemHead(
+                        (struct List *)&found->event_queue)) != NULL) {
+                struct IOSana2Req *pending = (struct IOSana2Req *)node;
+                pending->ios2_Req.io_Error = IOERR_ABORTED;
+                IExec->ReplyMsg((struct Message *)pending);
+            }
+            IExec->Remove((struct Node *)&found->node);
+        }
+        IExec->ReleaseSemaphore(&devBase->opener_lock);
+        if (found) IExec->FreeVec(found);
     }
-    base->lo_unit.unit_OpenCnt--;
-    base->dev_Base.dd_Library.lib_OpenCnt--;
-    IExec->ReleaseSemaphore(&base->io_lock);
-    return (BPTR)NULL;
+
+    ioreq->ios2_Req.io_Unit   = (struct Unit *)-1;
+    ioreq->ios2_Req.io_Device = (struct Device *)-1;
+
+    if (devBase->lo_unit.unit_OpenCnt > 0)
+        devBase->lo_unit.unit_OpenCnt--;
+    devBase->dev_Base.dd_Library.lib_OpenCnt--;
+
+#ifdef DEBUG
+    /* Development builds: force expunge on last-close so each testopen
+     * run re-runs Init and picks up freshly pushed binaries. In release
+     * builds we behave normally (stay resident until LIBF_DELEXP set). */
+    if (devBase->dev_Base.dd_Library.lib_OpenCnt == 0) {
+        seglist = _manager_Expunge(Self);
+    }
+#else
+    if (devBase->dev_Base.dd_Library.lib_OpenCnt == 0
+        && (devBase->dev_Base.dd_Library.lib_Flags & LIBF_DELEXP))
+    {
+        seglist = _manager_Expunge(Self);
+    }
+#endif
+
+    return seglist;
 }
 
+BPTR _manager_Expunge(struct DeviceManagerInterface *Self)
+{
+    struct LoopbackBase *devBase = (struct LoopbackBase *)Self->Data.LibBase;
+    struct ExecIFace *IExec = devBase->IExec;
+    BPTR seglist = (BPTR)NULL;
+
+    if (devBase->dev_Base.dd_Library.lib_OpenCnt == 0) {
+        seglist = devBase->dev_SegList;
+        IExec->Remove((struct Node *)devBase);
+
+        /* Release resources in reverse-acquire order.
+         *
+         * FIRST: mask interrupts + remove the IntServer so a late-arriving
+         * interrupt can't dereference base fields we're about to free. */
+        if (devBase->bar0) {
+            volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
+            e1000_write32(mmio, E1000_REG_IMC, 0xFFFFFFFFUL);
+            (void)e1000_read32(mmio, E1000_REG_ICR);
+        }
+        if (devBase->irq_installed) {
+            IExec->RemIntServer(devBase->irq_vector, &devBase->irq_node);
+            devBase->irq_installed = FALSE;
+        }
+
+        /* Phase 6k: stop the unit task before freeing anything it may
+         * still reference. Order: quiesce HW (above) → RemIntServer
+         * (so ISR can't run) → stop task (so it can't process late-
+         * arriving signals against freed memory). */
+        lo_task_stop(devBase, IExec);
+
+        /* Free any Openers still on the list (there shouldn't be any at
+         * Expunge time — Close should have cleaned up — but defensive). */
+        {
+            struct LoOpener *op;
+            IExec->ObtainSemaphore(&devBase->opener_lock);
+            while ((op = (struct LoOpener *)
+                    IExec->RemHead((struct List *)&devBase->opener_list)) != NULL) {
+                IExec->FreeVec(op);
+            }
+            IExec->ReleaseSemaphore(&devBase->opener_lock);
+        }
+
+        if (devBase->tx_scratch)  { IExec->FreeVec(devBase->tx_scratch);  devBase->tx_scratch  = NULL; }
+        if (devBase->tx_scratch2) { IExec->FreeVec(devBase->tx_scratch2); devBase->tx_scratch2 = NULL; }
+        if (devBase->tx_pool) {
+            IExec->FreeMem(devBase->tx_pool, VN_TX_POOL_SLOTS * VN_TX_SLOT_SIZE);
+            devBase->tx_pool = NULL;
+        }
+        if (devBase->rx_buffers)  { IExec->FreeVec(devBase->rx_buffers);  devBase->rx_buffers  = NULL; }
+        if (devBase->tx_ring)     { IExec->FreeVec(devBase->tx_ring);     devBase->tx_ring     = NULL; }
+        if (devBase->rx_ring)     { IExec->FreeVec(devBase->rx_ring);     devBase->rx_ring     = NULL; }
+        /* Phase 10j-15: rings allocated via AllocMem+manual-align; free
+         * the pre-alignment raw pointer with FreeMem. */
+        if (devBase->rx_vring_raw) {
+            IExec->FreeVec(devBase->rx_vring_raw);
+            devBase->rx_vring_raw = NULL; devBase->rx_vring = NULL;
+        }
+        if (devBase->tx_vring_raw) {
+            IExec->FreeVec(devBase->tx_vring_raw);
+            devBase->tx_vring_raw = NULL; devBase->tx_vring = NULL;
+        }
+        if (devBase->bar0) {
+            devBase->pciDevice->FreeResourceRange(devBase->bar0);
+            devBase->bar0 = NULL;
+        }
+        if (devBase->pciDevice) {
+            devBase->IPCI->FreeDevice(devBase->pciDevice);
+            devBase->pciDevice = NULL;
+        }
+        if (devBase->IPCI) {
+            IExec->DropInterface((struct Interface *)devBase->IPCI);
+            devBase->IPCI = NULL;
+        }
+        if (devBase->ExpansionBase) {
+            IExec->CloseLibrary(devBase->ExpansionBase);
+            devBase->ExpansionBase = NULL;
+        }
+        if (devBase->IUtility) {
+            IExec->DropInterface((struct Interface *)devBase->IUtility);
+            devBase->IUtility = NULL;
+        }
+        if (devBase->UtilityBase) {
+            IExec->CloseLibrary(devBase->UtilityBase);
+            devBase->UtilityBase = NULL;
+        }
+
+        IExec->DebugPrintF("[loopback] Expunge: goodbye.\n");
+        IExec->DeleteLibrary((struct Library *)devBase);
+    } else {
+        devBase->dev_Base.dd_Library.lib_Flags |= LIBF_DELEXP;
+    }
+    return seglist;
+}
+
+/* -------- Phase 6a: online/offline hardware helpers ----------
+ * Called from BeginIO's S2_ONLINE / S2_OFFLINE cases (below). Keeping
+ * the actual register writes here rather than inline in the dispatch
+ * so the state-machine logic stays readable and the hardware sequence
+ * can be reused by future code paths (S2_CONFIGINTERFACE that changes
+ * MAC while online would need offline-then-online semantics, for
+ * example). */
+#define E1000_RCTL_EN     (1U << 1)
+#define E1000_RCTL_UPE    (1U << 3)   /* Unicast Promiscuous — accept any dst MAC */
+#define E1000_RCTL_MPE    (1U << 4)   /* Multicast Promiscuous — accept any multicast */
+#define E1000_RCTL_BAM    (1U << 15)
+#define E1000_RCTL_SECRC  (1U << 26)
+#define E1000_TCTL_EN     (1U << 1)
+#define E1000_TCTL_PSP    (1U << 3)
+#define E1000_TCTL_CT(v)   (((v) & 0xff)  << 4)
+#define E1000_TCTL_COLD(v) (((v) & 0x3ff) << 12)
+#define E1000_INTR_TXDW    (1U << 0)
+#define E1000_INTR_LSC     (1U << 2)
+#define E1000_INTR_RXT0    (1U << 7)
+
+static void vn_online_hw(struct LoopbackBase *base)
+{
+    if (!base->bar0) return;
+    volatile void *mmio = (volatile void *)base->bar0->BaseAddress;
+    /* Phase 6l: enable UPE/MPE to eliminate RCTL filtering as a suspect —
+     * MAC-filter miss would silently drop the ARP reply from QEMU. With
+     * promiscuous on, any frame QEMU sends to the wire lands in the ring. */
+    e1000_write32(mmio, E1000_REG_RCTL,
+                  E1000_RCTL_EN | E1000_RCTL_UPE | E1000_RCTL_MPE
+                  | E1000_RCTL_BAM | E1000_RCTL_SECRC);
+    e1000_write32(mmio, E1000_REG_TCTL, E1000_TCTL_EN | E1000_TCTL_PSP
+                                       | E1000_TCTL_CT(0x0F) | E1000_TCTL_COLD(0x40));
+    e1000_write32(mmio, E1000_REG_IMS, E1000_INTR_LSC | E1000_INTR_RXT0 | E1000_INTR_TXDW);
+}
+
+static void vn_offline_hw(struct LoopbackBase *base)
+{
+    if (!base->bar0) return;
+    volatile void *mmio = (volatile void *)base->bar0->BaseAddress;
+    e1000_write32(mmio, E1000_REG_IMC, 0xFFFFFFFFUL);
+    (void)e1000_read32(mmio, E1000_REG_ICR);
+    e1000_write32(mmio, E1000_REG_RCTL, 0);
+    e1000_write32(mmio, E1000_REG_TCTL, 0);
+}
+
+/* PHASE 7q: BeginIO is now just a thin PutMsg — the unit task
+ * dispatches each command in ITS own context (see lo_task_body).
+ * This is the rolsen74/amy_skeletons pattern — running command
+ * handlers inline in the caller's task context (i.e. Roadshow's
+ * AddInterface task) is what caused the DSI guru at 0x01855a0c.
+ * See docs/DEBUGGING.md phase 7p for the full analysis. */
 void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *ioreq)
 {
-    struct LoopbackBase *base = (struct LoopbackBase *)Self->Data.LibBase;
-    struct ExecIFace *IExec = base->IExec;
+    struct LoopbackBase *devBase = (struct LoopbackBase *)Self->Data.LibBase;
+    struct ExecIFace *IExec = devBase->IExec;
 
-    /* Fast path for read-only DBG commands — dispatch synchronously
-     * so tests without a task can DoIO them. */
-    UWORD cmd = ioreq->ios2_Req.io_Command;
-    if (cmd == LO_DBG_STATUS || cmd == S2_DEVICEQUERY ||
-        cmd == NSCMD_DEVICEQUERY || cmd == S2_GETSTATIONADDRESS) {
-        lo_dispatch_ioreq(base, ioreq);
-        return;
-    }
-
-    /* Async — send to unit task. If task didn't come up (begin_port
-     * NULL), dispatch synchronously so we don't PutMsg(NULL, ...). */
-    if (!base->begin_port) {
-        lo_dispatch_ioreq(base, ioreq);
-        return;
-    }
-    ioreq->ios2_Req.io_Flags &= ~IOF_QUICK;
+    /* Standard SANA-II: reject QUICK-io (we always process
+     * asynchronously via the unit task). */
     ioreq->ios2_Req.io_Message.mn_Node.ln_Type = NT_MESSAGE;
-    IExec->PutMsg(base->begin_port, (struct Message *)ioreq);
-}
-
-LONG _manager_AbortIO(struct DeviceManagerInterface *Self, struct IOSana2Req *ioreq)
-{
-    (void)Self;
-    return ioreq->ios2_Req.io_Error;
-}
-
-/* ---------- Dispatch ---------- */
-
-static void lo_dispatch_ioreq(struct LoopbackBase *base, struct IOSana2Req *ioreq)
-{
-    struct ExecIFace *IExec = base->IExec;
-    UWORD cmd = ioreq->ios2_Req.io_Command;
-    struct LoOpener *op = (struct LoOpener *)ioreq->ios2_BufferManagement;
-    BOOL will_reply = TRUE;
-
+    ioreq->ios2_Req.io_Flags &= ~IOF_QUICK;
     ioreq->ios2_Req.io_Error = 0;
     ioreq->ios2_WireError    = 0;
 
-    switch (cmd) {
-
-    case CMD_WRITE:
-    case S2_BROADCAST: {
-        if (base->state != LO_STATE_ONLINE) {
-            ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
-            ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
-            break;
-        }
-        uint32 _t0 = lo_tb();
-        base->prof_tx_calls++;
-        base->packets_tx++;
-        base->bytes_tx += ioreq->ios2_DataLength;
-        lo_deliver(base, ioreq, op);
-        base->prof_tx_c_total += (lo_tb() - _t0);
-        break;
+    /* Phase 8c: fast-path DBG_STATUS + DBG_CMDLOG handling directly in
+     * BeginIO — no queueing to unit task. These commands are pure reads
+     * of LoopbackBase state and safe to run in the caller's context.
+     * Critical because if the unit task crashes, tests calling these
+     * commands via DoIO would hang forever waiting for the reply. */
+    UWORD cmd = ioreq->ios2_Req.io_Command;
+    if (cmd == VN_DBG_STATUS || cmd == VN_DBG_CMDLOG ||
+        cmd == VN_DBG_DQBUF   || cmd == VN_DBG_CFGBUF ||
+        cmd == VN_DBG_DUMPTX  || cmd == VN_DBG_PROFILE) {
+        lo_dispatch_ioreq(devBase, ioreq);
+        return;
     }
 
-    case CMD_READ:
-    case S2_READORPHAN: {
-        if (base->state != LO_STATE_ONLINE) {
-            ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
-            ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
-            break;
-        }
-        if (!op) {
-            ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
-            break;
-        }
-        IExec->ObtainSemaphore(&base->opener_lock);
-        IExec->AddTail((struct List *)&op->read_queue,
-                       (struct Node *)&ioreq->ios2_Req.io_Message.mn_Node);
-        IExec->ReleaseSemaphore(&base->opener_lock);
-        will_reply = FALSE;   /* held for future TX */
-        break;
+    if (devBase->begin_port) {
+        IExec->PutMsg(devBase->begin_port, (struct Message *)ioreq);
+    } else {
+        /* Unit task not up (shouldn't happen if Init succeeded);
+         * fall back to synchronous dispatch so caller doesn't hang. */
+        lo_dispatch_ioreq(devBase, ioreq);
     }
+}
 
-    case S2_ONLINE:
-        base->state = LO_STATE_ONLINE;
-        break;
+/* PHASE 7q: the actual command dispatcher — runs in the unit task's
+ * context, invoked from lo_task_body when a message arrives on
+ * begin_port. This was the body of _manager_BeginIO pre-refactor. */
+static void lo_dispatch_ioreq(struct LoopbackBase *devBase, struct IOSana2Req *ioreq)
+{
+    struct ExecIFace *IExec = devBase->IExec;
 
-    case S2_OFFLINE:
-        base->state = LO_STATE_CONFIGURED;
-        break;
+    /* Phase 8f: cmdlog write at DISPATCH ENTRY, not exit. When the
+     * switch-body crashes (e.g., DSI 0x01855a0c inside CMD_WRITE),
+     * the tail cmdlog write in the exit path never runs, so we lose
+     * the record of the crashing command. Write the dispatch stub
+     * NOW; the exit path will (harmlessly) overwrite the same slot
+     * with post-processing state (ioerr/wire/etc.). */
+    devBase->last_dispatched_cmd = ioreq->ios2_Req.io_Command;
 
-    case S2_CONFIGINTERFACE: {
-        BOOL any = FALSE;
-        for (int i = 0; i < 6; i++) if (ioreq->ios2_SrcAddr[i]) any = TRUE;
-        if (any) {
-            for (int i = 0; i < 6; i++) base->mac[i] = ioreq->ios2_SrcAddr[i];
-        }
-        base->mac_set = TRUE;
-        base->state   = LO_STATE_CONFIGURED;
-        break;
-    }
-
-    case S2_GETSTATIONADDRESS:
-        for (int i = 0; i < 6; i++) {
-            ioreq->ios2_SrcAddr[i] = base->mac[i];
-            ioreq->ios2_DstAddr[i] = base->mac[i];
-        }
-        break;
+    switch (ioreq->ios2_Req.io_Command) {
 
     case S2_DEVICEQUERY: {
+        /* SANA-II-NOTES §3.1 + §5. The caller passes a pointer to a
+         * Sana2DeviceQuery in ios2_StatData with SizeAvailable set;
+         * we fill in the OUT fields and set SizeSupplied. Values
+         * hardcoded for a QEMU-emulated 82540EM — BPS reports 1 Gbps
+         * because QEMU never negotiates below max. */
+        /* SANA-II Rev 4 §3.1: the Sana2DeviceQuery struct is passed in
+         * ios2_StatData. Roadshow follows the spec strictly — ios2_Data
+         * contains a stale pointer from prior request reuse (cmdlog
+         * consistently shows data=0x6EDExxxx with len=24 — that's a
+         * DIFFERENT buffer, not our query struct).
+         *
+         * PRIOR BUG: we read ios2_Data first, then StatData as fallback.
+         * That wrote our MTU/HW/BPS values into the wrong buffer.
+         * Roadshow's real query struct stayed all-zero, so
+         * QueryInterfaceTagList reported MTU=0 / HardwareType=0 and
+         * ConfigureNetInterface UP failed with ENOBUFS because
+         * request-alloc size = 0 + overhead. */
         struct Sana2DeviceQuery *q = (struct Sana2DeviceQuery *)ioreq->ios2_StatData;
         if (!q) q = (struct Sana2DeviceQuery *)ioreq->ios2_Data;
-        if (!q) { ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES; break; }
+        if (!q) {
+            ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
+            ioreq->ios2_WireError    = S2WERR_NULL_POINTER;
+            break;
+        }
+        /* Reference implementation via kas1e/pa6t_eth's SANA-II Rev 7
+         * Ethernet driver - it uses strict offsetof gating per field,
+         * caps SizeSupplied at SizeAvailable, and never writes past
+         * caller's declared buffer. Olaf Barthel (Roadshow author)
+         * confirms this contract in his own SANA-II client:
+         *
+         *    s2dq.SizeAvailable = sizeof(s2dq) - sizeof(s2dq.RawMTU);
+         *    // "The SizeAvailable field must not suggest a larger
+         *    //  value than the driver is prepared to accept, or
+         *    //  strange things may happen."
+         *
+         * Roadshow allocates a small (24-byte) Sana2DeviceQuery for
+         * its probe pass and passes SizeAvailable to match. If we
+         * write past that, we clobber Roadshow-heap fields adjacent
+         * to the query struct - one of which is the size arg for
+         * Roadshow's post-CONFIG "alloc a receive packet" call.
+         * That's the smoking gun for the observed "Could not
+         * allocate a network packet of 0 bytes" NetLogViewer error
+         * that persisted across every S2_DEVICEQUERY field value we
+         * tried. The 0 is a real 0, not a NULL-pointer print. */
+        /* Phase 7a diagnostic: snapshot the caller's buffer BEFORE we
+         * write anything. This lets DBG_DQBUF dump what Roadshow
+         * allocated + initialized, so we can see if SizeAvailable is
+         * what we expect and whether writes past our SizeSupplied
+         * cap are actually landing outside a valid buffer. */
+        devBase->deviceq_call_count++;
+        devBase->deviceq_sizeavailable = q->SizeAvailable;
+        {
+            volatile UBYTE *src = (volatile UBYTE *)q;
+            volatile UBYTE *dst = devBase->deviceq_before;
+            for (int i = 0; i < 48; i++) dst[i] = src[i];
+        }
+
+        /* PHASE 7r ROOT CAUSE FIX (rtl8139 comparative RE):
+         * Disassembly of rtl8139.device's S2_DEVICEQUERY at 0x1002370
+         * shows it uses PACK(2) Sana2DeviceQuery — sizeof = 34, NOT 36.
+         * MTU is at offset 18, BPS at 22, HardwareType at 26, RawMTU
+         * at 30. Our compilation uses NATURAL PPC alignment so our
+         * `q->MTU = X` writes at offset 20 (wrong). Roadshow reads
+         * fields at the pack(2) offsets — which for us are still 0
+         * plus one AddrFieldSize-padding byte, i.e. garbage. That
+         * garbage propagates into the interpreter at 0x01855a0c and
+         * crashes.
+         *
+         * Fix: byte-level writes at rtl8139's exact offsets. Ignore
+         * our compiler's `struct Sana2DeviceQuery` layout entirely
+         * for the wire representation. Also matches rtl8139's cap
+         * of size=34 in SizeSupplied. */
         UBYTE *raw = (UBYTE *)q;
+        ULONG size_wire = 34;   /* pack(2) Sana2DeviceQuery */
+        /* PHASE 7s: MATCH RTL8139 EXACTLY. rtl8139's handler does:
+         *   supply = min(q->SizeAvailable, 34)     — no fallback for 0
+         *   CopyMem(template, q, supply)           — copy that many bytes
+         *   q->SizeSupplied = supply               — unconditional at +4
+         *   *(q + 22) = runtime_BPS                — unconditional at +22
+         *
+         * If Roadshow passes SizeAvailable=0, rtl8139 copies 0 bytes;
+         * only the two post-copy stores fire (at +4 and +22). Our
+         * matching version: same shape. Just per-field writes bounded
+         * by supply, plus unconditional SizeSupplied (+4) and BPS
+         * (+22) — trusting rtl8139's behavior since Roadshow demonstrably
+         * accepts it. */
+        /* supply=34 covers the full pack(2) Sana2DeviceQuery through
+         * RawMTU (offset 30-33). Earlier the code was capped at 24 to
+         * match a "test that worked" but that skipped HardwareType at
+         * offset 26 — Roadshow then reported the interface type as
+         * "Unknown (0)" (visible in ShowNetStatus) and refused to
+         * forward frames out of it despite everything else being
+         * configured. rtl8139's own template is 34 bytes so the
+         * larger supply is what the wire-format-compatible caller
+         * expects anyway. */
         ULONG supply = 34;
+        if (supply > size_wire) supply = size_wire;
+        /* Zero-fill the fields we're going to write into. `volatile`
+         * defeats GCC's -O2 conversion of the loop into memset() — a
+         * resident-tag .device can't link against newlib's memset
+         * (INewlib is not resolved in this build). */
         {
             volatile UBYTE *vraw = raw;
             for (ULONG i = 0; i < supply; i++) vraw[i] = 0;
         }
-        #define WU16(o,v) do { if (supply>=(o)+2){raw[(o)+0]=(UBYTE)((v)>>8);raw[(o)+1]=(UBYTE)(v);} } while(0)
-        #define WU32(o,v) do { if (supply>=(o)+4){raw[(o)+0]=(UBYTE)((v)>>24);raw[(o)+1]=(UBYTE)((v)>>16);raw[(o)+2]=(UBYTE)((v)>>8);raw[(o)+3]=(UBYTE)(v);} } while(0)
-        WU32( 0, q->SizeAvailable);
-        WU32( 4, supply);
-        WU32( 8, 0);
-        WU32(12, 0);
-        WU16(16, 48);
-        WU32(18, 1500);
-        WU32(22, 1000000000UL);
-        WU32(26, S2WireType_Ethernet);
-        WU32(30, 1514);
-        #undef WU16
-        #undef WU32
-        break;
-    }
 
-    case S2_ADDMULTICASTADDRESS:
-    case S2_DELMULTICASTADDRESS:
-    case S2_ADDMULTICASTADDRESSES:
-    case S2_DELMULTICASTADDRESSES:
-    case S2_TRACKTYPE:
-    case S2_UNTRACKTYPE:
-        break;   /* accept */
+        #define S2DQ_WU16(off, val)   do { \
+            if (supply >= (off) + 2) { \
+                raw[(off) + 0] = (UBYTE)(((val) >> 8) & 0xFF); \
+                raw[(off) + 1] = (UBYTE)( (val)       & 0xFF); \
+            } } while (0)
+        #define S2DQ_WU32(off, val)   do { \
+            if (supply >= (off) + 4) { \
+                raw[(off) + 0] = (UBYTE)(((val) >> 24) & 0xFF); \
+                raw[(off) + 1] = (UBYTE)(((val) >> 16) & 0xFF); \
+                raw[(off) + 2] = (UBYTE)(((val) >>  8) & 0xFF); \
+                raw[(off) + 3] = (UBYTE)( (val)        & 0xFF); \
+            } } while (0)
 
-    case S2_SANA2HOOK: {
-        struct Sana2Hook *hook = (struct Sana2Hook *)ioreq->ios2_Data;
-        if (!hook) hook = (struct Sana2Hook *)ioreq->ios2_StatData;
-        if (!hook || !op) {
-            ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
-            break;
+        S2DQ_WU32( 0, q->SizeAvailable);   /* preserve caller's value */
+        S2DQ_WU32( 4, supply);             /* SizeSupplied */
+        S2DQ_WU32( 8, 0);                  /* DevQueryFormat */
+        S2DQ_WU32(12, 0);                  /* DeviceLevel */
+        S2DQ_WU16(16, 48);                 /* AddrFieldSize (UWORD) */
+        S2DQ_WU32(18, 1500);               /* MTU — pack(2) offset */
+        S2DQ_WU32(22, 1000000000UL);       /* BPS — pack(2) offset */
+        S2DQ_WU32(26, S2WireType_Ethernet);/* HardwareType — pack(2) offset */
+        S2DQ_WU32(30, 1514);               /* RawMTU — pack(2) offset */
+
+        #undef S2DQ_WU16
+        #undef S2DQ_WU32
+        /* Phase 7a diagnostic AFTER snapshot. */
+        {
+            volatile UBYTE *src = (volatile UBYTE *)q;
+            volatile UBYTE *dst = devBase->deviceq_after;
+            for (int i = 0; i < 48; i++) dst[i] = src[i];
         }
-        op->sana2_hook         = &hook->s2h_Hook;
-        op->sana2_hook_methods = (ULONG *)hook->s2h_Methods;
         break;
     }
 
     case NSCMD_DEVICEQUERY: {
-        struct NSDeviceQueryResult *nsdq = (struct NSDeviceQueryResult *)ioreq->ios2_Data;
-        if (!nsdq || ioreq->ios2_DataLength < sizeof(*nsdq)) {
+        /* New-style device query — Roadshow and other stack layers call
+         * this to enumerate supported commands. OS4 exec may ALSO be
+         * calling it internally before dispatching commands, then rejecting
+         * anything not in the list with IOERR_UNITBUSY. Format from
+         * <devices/newstyle.h>: caller sets ios2_Data (via IOStdReq view:
+         * io_Data at offset 40 = ios2_SrcAddr[0..3] here — but Roadshow
+         * uses IOStdReq, not IOSana2Req, for this call, so we access
+         * fields through the IOStdReq layout). */
+        struct IOStdReq *sreq = (struct IOStdReq *)ioreq;
+        ULONG want = sizeof(struct NSDeviceQueryResult);
+        if (!sreq->io_Data || sreq->io_Length < want) {
             ioreq->ios2_Req.io_Error = IOERR_BADLENGTH;
             break;
         }
-        nsdq->DevQueryFormat = 0;
-        nsdq->SizeAvailable  = sizeof(*nsdq);
-        nsdq->DeviceType     = NSDEVTYPE_SANA2;
-        nsdq->DeviceSubType  = 0;
-        nsdq->SupportedCommands = (UWORD *)lo_supported_cmds;
-        ioreq->ios2_DataLength = sizeof(*nsdq);
+        struct NSDeviceQueryResult *r = (struct NSDeviceQueryResult *)sreq->io_Data;
+        r->DevQueryFormat    = 0;
+        r->SizeAvailable     = want;
+        r->DeviceType        = NSDEVTYPE_SANA2;
+        r->DeviceSubType     = 0;
+        r->SupportedCommands = (UWORD *)vn_supported_cmds;
+        sreq->io_Actual      = want;
         break;
     }
 
-    case LO_DBG_STATUS: {
+    case VN_DBG_RECV: {
+        /* Phase 6j-3: reap one RX descriptor and deliver via the
+         * caller's CopyToBuff hook.
+         *
+         * Contract:
+         *   IN:  ios2_Data           = target cookie (opaque, passed to
+         *                              CopyToBuff as schm_To)
+         *        ios2_BufferManagement = same as at Open (opener lookup)
+         *   OUT: ios2_DataLength     = frame length (payload after 14-byte
+         *                              Ethernet header stripped)
+         *        ios2_PacketType     = ethertype from the frame
+         *        ios2_SrcAddr[0..5]  = source MAC from the frame
+         *        io_Error            = 0 on success, IOERR_UNITBUSY if
+         *                              no DD-set descriptor
+         *
+         * Simplification: only walks slot 0 for this first cut. Real
+         * driver needs rx_next_clean tracking + RDT refill. */
+        if (devBase->state != LO_STATE_ONLINE || !devBase->rx_ring) {
+            ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+            ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
+            break;
+        }
+        volatile UBYTE *rr = (volatile UBYTE *)devBase->rx_ring;
+        volatile UBYTE *rd = rr + (0 * VN_DESC_SIZE);  /* slot 0 */
+        if (!(rd[12] & 0x01)) {
+            ioreq->ios2_Req.io_Error = IOERR_UNITBUSY;
+            break;
+        }
+        /* Length in bytes 8-9 (LE). */
+        ULONG frame_len = ((ULONG)rd[9] << 8) | (ULONG)rd[8];
+        if (frame_len < 14 || frame_len > VN_RX_BUFSIZE) {
+            /* Malformed length — clear descriptor + refuse. */
+            rd[12] = 0;
+            ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+            break;
+        }
+        UBYTE *rxbuf = (UBYTE *)devBase->rx_buffers + (0 * VN_RX_BUFSIZE);
+
+        /* Fill SrcAddr from the frame (bytes 6..11). Ethertype = 12..13. */
+        for (int i = 0; i < 6; i++) ioreq->ios2_SrcAddr[i] = rxbuf[6 + i];
+        ioreq->ios2_PacketType = ((ULONG)rxbuf[12] << 8) | (ULONG)rxbuf[13];
+        ULONG payload_len = frame_len - 14;
+
+        /* Try cooked delivery via CopyToBuff hook. If we have an
+         * opener with a hook + IUtility, invoke it with schm_To =
+         * caller's cookie (ios2_Data), schm_From = payload start
+         * (after Ethernet header). */
+        struct LoOpener *op = NULL;
+        if (ioreq->ios2_BufferManagement) {
+            IExec->ObtainSemaphore(&devBase->opener_lock);
+            op = vn_find_opener(devBase, ioreq->ios2_BufferManagement);
+            IExec->ReleaseSemaphore(&devBase->opener_lock);
+        }
+        if (op && op->copy_to_buff && devBase->IUtility && ioreq->ios2_Data) {
+            BOOL ok = vn_invoke_copy_to(devBase, op, ioreq, rxbuf + 14, payload_len);
+            if (!ok) {
+                ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+                ioreq->ios2_WireError    = S2WERR_BUFF_ERROR;
+                /* fall through — clear descriptor either way */
+            }
+        }
+        /* If no hook installed, caller can inspect payload directly:
+         * we've populated ios2_PacketType / SrcAddr, and they know
+         * where their own buffer is. This is for testrx-style callers. */
+
+        ioreq->ios2_DataLength = payload_len;
+
+        /* Reset descriptor status so HW can reuse this slot on wrap.
+         * Clean would be: advance RDT to hand the slot back to HW.
+         * For the first-cut single-slot demo we just clear DD; the
+         * RDT stays where it is. Enough to prove the round-trip. */
+        rd[12] = 0;
+        break;
+    }
+
+    case VN_DBG_STATUS: {
+        /* virtnet private diagnostic. Field overloads:
+         *   ios2_DataLength = irq_counter (total ISR fires since Init)
+         *   ios2_WireError  = last_icr    (bitmap of last causes seen)
+         *   ios2_PacketType = state       (VN_STATE_*)
+         *   ios2_SrcAddr[0..3] = TPT (Total Packets Transmitted)
+         *   ios2_SrcAddr[4..7] = RDH (RX Descriptor Head — advances on each
+         *                       packet HW DMAs into our ring; also
+         *                       accumulates count of DD-set descriptors)
+         *   ios2_DstAddr[0..3] = count of RX descriptors whose STATUS.DD
+         *                       bit is currently set (unclaimed packets)
+         *   ios2_DstAddr[4..5] = length of first DD-set RX descriptor
+         */
+        ioreq->ios2_DataLength = devBase->irq_counter;
+        ioreq->ios2_WireError  = devBase->last_icr;
+        ioreq->ios2_PacketType = devBase->state;
+        /* Phase 10g: expose virtio queue state — we don't have bar0
+         * (I/O port device), so read used->idx directly from vring
+         * memory. */
+        if (devBase->state == LO_STATE_ONLINE && devBase->rx_vring) {
+            UWORD num = devBase->rx_vring_num;
+            UBYTE *used_bytes = ((UBYTE *)devBase->rx_vring) + VRING_USED_OFFSET(num);
+            struct vring_used_header *used = (struct vring_used_header *)used_bytes;
+            UWORD used_idx = vio_le16_get(&used->idx);
+            UWORD last_used = devBase->rx_last_used;
+            ULONG pending = (ULONG)(UWORD)(used_idx - last_used);
+            UBYTE *avail_bytes = ((UBYTE *)devBase->rx_vring) + VRING_AVAIL_OFFSET(num);
+            struct vring_avail_header *avail = (struct vring_avail_header *)avail_bytes;
+            UWORD avail_idx = vio_le16_get(&avail->idx);
+            ioreq->ios2_SrcAddr[0] = (UBYTE)(used_idx >> 8);
+            ioreq->ios2_SrcAddr[1] = (UBYTE)(used_idx);
+            ioreq->ios2_SrcAddr[2] = (UBYTE)(last_used >> 8);
+            ioreq->ios2_SrcAddr[3] = (UBYTE)(last_used);
+            ioreq->ios2_SrcAddr[4] = (UBYTE)(avail_idx >> 8);
+            ioreq->ios2_SrcAddr[5] = (UBYTE)(avail_idx);
+            ioreq->ios2_DstAddr[0] = (UBYTE)(pending >> 24);
+            ioreq->ios2_DstAddr[1] = (UBYTE)(pending >> 16);
+            ioreq->ios2_DstAddr[2] = (UBYTE)(pending >> 8);
+            ioreq->ios2_DstAddr[3] = (UBYTE)(pending);
+        }
+        ioreq->ios2_DstAddr[6]  = (UBYTE)(devBase->task_wake_count >> 8);
+        ioreq->ios2_DstAddr[7]  = (UBYTE)(devBase->task_wake_count);
+        ioreq->ios2_DstAddr[8]  = (UBYTE)(devBase->process_rx_dd_seen >> 8);
+        ioreq->ios2_DstAddr[9]  = (UBYTE)(devBase->process_rx_dd_seen);
+        ioreq->ios2_DstAddr[10] = (UBYTE)(devBase->process_rx_delivered >> 8);
+        ioreq->ios2_DstAddr[11] = (UBYTE)(devBase->process_rx_delivered);
+        /* Phase 8f: last_dispatched_cmd in DstAddr[12..13]. Non-zero
+         * post-crash tells us what command was being processed when
+         * the driver task died. */
+        ioreq->ios2_DstAddr[12] = (UBYTE)(devBase->last_dispatched_cmd >> 8);
+        ioreq->ios2_DstAddr[13] = (UBYTE)(devBase->last_dispatched_cmd);
+        /* Overload SrcAddr[6..15] + DstAddr[14..15] to carry TX ring
+         * diagnostic set by CMD_WRITE:
+         *   SrcAddr[6..9]   = tavail address (last write target)
+         *   SrcAddr[10..11] = written idx (what we tried to store)
+         *   SrcAddr[12..13] = readback idx (what CPU sees after write)
+         *   SrcAddr[14..15] = TX used->idx (what QEMU has confirmed)
+         *   DstAddr[14..15] = TX avail_ring[0] (descriptor idx written) */
+        ULONG tap = (ULONG)devBase->last_copy_to_ptr;
+        ioreq->ios2_SrcAddr[6]  = (UBYTE)(tap >> 24);
+        ioreq->ios2_SrcAddr[7]  = (UBYTE)(tap >> 16);
+        ioreq->ios2_SrcAddr[8]  = (UBYTE)(tap >> 8);
+        ioreq->ios2_SrcAddr[9]  = (UBYTE)(tap);
+        ULONG w = devBase->last_copy_to_tag;
+        ioreq->ios2_SrcAddr[10] = (UBYTE)(w >> 8);
+        ioreq->ios2_SrcAddr[11] = (UBYTE)(w);
+        ULONG r = devBase->last_copy_to_size;
+        ioreq->ios2_SrcAddr[12] = (UBYTE)(r >> 8);
+        ioreq->ios2_SrcAddr[13] = (UBYTE)(r);
+        /* TX used-idx from actual ring memory (if TX vring exists). */
+        if (devBase->tx_vring) {
+            UWORD tnum = devBase->tx_vring_num;
+            UBYTE *tused_b = ((UBYTE *)devBase->tx_vring) + VRING_USED_OFFSET(tnum);
+            struct vring_used_header *tused = (struct vring_used_header *)tused_b;
+            UWORD tused_idx = vio_le16_get(&tused->idx);
+            ioreq->ios2_SrcAddr[14] = (UBYTE)(tused_idx >> 8);
+            ioreq->ios2_SrcAddr[15] = (UBYTE)(tused_idx);
+            UBYTE *tavail_b = ((UBYTE *)devBase->tx_vring) + VRING_AVAIL_OFFSET(tnum);
+            uint16 *tavail_ring = (uint16 *)(tavail_b + 4);
+            UWORD desc_idx = vio_le16_get(&tavail_ring[0]);
+            ioreq->ios2_DstAddr[14] = (UBYTE)(desc_idx >> 8);
+            ioreq->ios2_DstAddr[15] = (UBYTE)(desc_idx);
+        }
+        break;
+    }
+
+    case VN_DBG_CMDLOG: {
+        /* Dump the cmdlog ring into caller's buffer. 40 bytes/entry:
+         *   [0..1]  cmd
+         *   [2]     flags_in
+         *   [3]     (pad)
+         *   [4..5]  ioerr
+         *   [6..7]  ptype_in
+         *   [8..11] wire
+         *   [12..15] data_in ptr
+         *   [16..19] datalen_out
+         *   [20..23] bm_in ptr
+         *   [24..29] src_out (6)
+         *   [30..35] dst_out (6)
+         *   [36..39] (reserved)
+         * Total 32 × 40 = 1280 bytes.
+         * Returns the ring's head index in ios2_DataLength. */
+        UBYTE *out = (UBYTE *)ioreq->ios2_Data;
+        if (out && ioreq->ios2_DataLength >= 32 * 40) {
+            ULONG head = devBase->cmdlog_head;
+            for (int i = 0; i < 32; i++) {
+                UBYTE *p = out + (i * 40);
+                p[0]  = (UBYTE)(devBase->cmdlog[i].cmd >> 8);
+                p[1]  = (UBYTE)(devBase->cmdlog[i].cmd);
+                p[2]  = devBase->cmdlog[i].flags_in;
+                p[3]  = 0;
+                p[4]  = (UBYTE)(devBase->cmdlog[i].ioerr >> 8);
+                p[5]  = (UBYTE)(devBase->cmdlog[i].ioerr);
+                p[6]  = (UBYTE)(devBase->cmdlog[i].ptype_in >> 8);
+                p[7]  = (UBYTE)(devBase->cmdlog[i].ptype_in);
+                p[8]  = (UBYTE)(devBase->cmdlog[i].wire >> 24);
+                p[9]  = (UBYTE)(devBase->cmdlog[i].wire >> 16);
+                p[10] = (UBYTE)(devBase->cmdlog[i].wire >> 8);
+                p[11] = (UBYTE)(devBase->cmdlog[i].wire);
+                p[12] = (UBYTE)(devBase->cmdlog[i].data_in >> 24);
+                p[13] = (UBYTE)(devBase->cmdlog[i].data_in >> 16);
+                p[14] = (UBYTE)(devBase->cmdlog[i].data_in >> 8);
+                p[15] = (UBYTE)(devBase->cmdlog[i].data_in);
+                p[16] = (UBYTE)(devBase->cmdlog[i].datalen_out >> 24);
+                p[17] = (UBYTE)(devBase->cmdlog[i].datalen_out >> 16);
+                p[18] = (UBYTE)(devBase->cmdlog[i].datalen_out >> 8);
+                p[19] = (UBYTE)(devBase->cmdlog[i].datalen_out);
+                p[20] = (UBYTE)(devBase->cmdlog[i].bm_in >> 24);
+                p[21] = (UBYTE)(devBase->cmdlog[i].bm_in >> 16);
+                p[22] = (UBYTE)(devBase->cmdlog[i].bm_in >> 8);
+                p[23] = (UBYTE)(devBase->cmdlog[i].bm_in);
+                for (int b = 0; b < 6; b++) {
+                    p[24 + b] = devBase->cmdlog[i].src_out[b];
+                    p[30 + b] = devBase->cmdlog[i].dst_out[b];
+                }
+                p[36] = p[37] = p[38] = p[39] = 0;
+            }
+            ioreq->ios2_DataLength = head;
+        }
+        break;
+    }
+
+    case VN_DBG_DUMPTX: {
+        /* Dump first 16 bytes of the last-built cooked TX frame so callers
+         * can eyeball the on-wire framing (Ethernet dst/src/etype + start
+         * of payload). Overloads ios2_SrcAddr[0..15]. */
+        if (devBase->tx_scratch) {
+            UBYTE *s = (UBYTE *)devBase->tx_scratch;
+            for (int i = 0; i < 16; i++) ioreq->ios2_SrcAddr[i] = s[i];
+        }
+        break;
+    }
+
+    case VN_DBG_CFGBUF: {
+        /* Dump last S2_CONFIGINTERFACE ioreq snapshot. */
+        UBYTE *out = (UBYTE *)ioreq->ios2_Data;
+        ULONG c = devBase->config_call_count;
+        ioreq->ios2_SrcAddr[0] = (UBYTE)(c >> 24);
+        ioreq->ios2_SrcAddr[1] = (UBYTE)(c >> 16);
+        ioreq->ios2_SrcAddr[2] = (UBYTE)(c >>  8);
+        ioreq->ios2_SrcAddr[3] = (UBYTE)c;
+        for (int i = 4; i < 16; i++) ioreq->ios2_SrcAddr[i] = 0;
+        if (out && ioreq->ios2_DataLength >= 160) {
+            volatile UBYTE *bsrc = devBase->config_before;
+            volatile UBYTE *asrc = devBase->config_after;
+            for (int i = 0; i < 80; i++) out[i]      = bsrc[i];
+            for (int i = 0; i < 80; i++) out[i + 80] = asrc[i];
+        }
+        break;
+    }
+
+    case VN_DBG_DQBUF: {
+        /* Dump last S2_DEVICEQUERY buffer snapshot. Header goes to
+         * ios2_SrcAddr[0..15]:
+         *   [0..3]  = deviceq_call_count (BE)
+         *   [4..7]  = deviceq_sizeavailable (BE)
+         *   [8..15] = pad
+         * Then 96 bytes to caller's ios2_Data:
+         *   [0..47]  = before-write snapshot
+         *   [48..95] = after-write snapshot */
+        UBYTE *out = (UBYTE *)ioreq->ios2_Data;
+        ULONG c = devBase->deviceq_call_count;
+        ULONG s = devBase->deviceq_sizeavailable;
+        ioreq->ios2_SrcAddr[0] = (UBYTE)(c >> 24);
+        ioreq->ios2_SrcAddr[1] = (UBYTE)(c >> 16);
+        ioreq->ios2_SrcAddr[2] = (UBYTE)(c >>  8);
+        ioreq->ios2_SrcAddr[3] = (UBYTE)c;
+        ioreq->ios2_SrcAddr[4] = (UBYTE)(s >> 24);
+        ioreq->ios2_SrcAddr[5] = (UBYTE)(s >> 16);
+        ioreq->ios2_SrcAddr[6] = (UBYTE)(s >>  8);
+        ioreq->ios2_SrcAddr[7] = (UBYTE)s;
+        for (int i = 8; i < 16; i++) ioreq->ios2_SrcAddr[i] = 0;
+        if (out && ioreq->ios2_DataLength >= 96) {
+            volatile UBYTE *bsrc = devBase->deviceq_before;
+            volatile UBYTE *asrc = devBase->deviceq_after;
+            for (int i = 0; i < 48; i++) out[i]      = bsrc[i];
+            for (int i = 0; i < 48; i++) out[i + 48] = asrc[i];
+        }
+        break;
+    }
+
+    case VN_DBG_PROFILE: {
+        /* Phase 13e: dump per-stage cycle counters. Ten ULONGs
+         * (BE-encoded) laid into ios2_Data. See VN_DBG_PROFILE in
+         * virtnet.h for the slot layout. Caller must supply >=40
+         * bytes in ios2_Data.  */
         UBYTE *out = (UBYTE *)ioreq->ios2_Data;
         if (!out || ioreq->ios2_DataLength < 40) {
             ioreq->ios2_Req.io_Error = IOERR_BADLENGTH;
             break;
         }
-        ULONG v[10];
-        v[0] = base->state;
-        v[1] = base->packets_tx;
-        v[2] = base->packets_rx;
-        v[3] = base->bytes_tx;
-        v[4] = base->bytes_rx;
-        v[5] = base->drops_no_reader;
-        v[6] = base->prof_tx_calls;
-        v[7] = base->prof_tx_c_total;
-        v[8] = base->prof_tx_c_cook;
-        v[9] = base->prof_tx_c_deliver;
-        for (int i = 0; i < 10; i++) {
-            out[i*4+0]=(UBYTE)(v[i]>>24);
-            out[i*4+1]=(UBYTE)(v[i]>>16);
-            out[i*4+2]=(UBYTE)(v[i]>>8);
-            out[i*4+3]=(UBYTE)(v[i]);
+        UWORD nfields = 11;
+        if (ioreq->ios2_DataLength < nfields * 4) {
+            ioreq->ios2_Req.io_Error = IOERR_BADLENGTH;
+            break;
         }
-        ioreq->ios2_DataLength = 40;
+        ULONG v[11];
+        v[0]  = devBase->prof_tx_calls;
+        v[1]  = devBase->prof_tx_c_total;
+        v[2]  = devBase->prof_tx_c_cook;
+        v[3]  = devBase->prof_tx_c_flush;
+        v[4]  = devBase->prof_tx_c_ring;
+        v[5]  = devBase->prof_tx_c_notify;
+        v[6]  = devBase->prof_rx_calls;
+        v[7]  = devBase->prof_rx_pkts;
+        v[8]  = devBase->prof_rx_c_total;
+        v[9]  = devBase->prof_rx_c_hook;
+        v[10] = devBase->prof_tx_c_hook;
+        for (int i = 0; i < nfields; i++) {
+            out[i*4 + 0] = (UBYTE)(v[i] >> 24);
+            out[i*4 + 1] = (UBYTE)(v[i] >> 16);
+            out[i*4 + 2] = (UBYTE)(v[i] >>  8);
+            out[i*4 + 3] = (UBYTE)(v[i]      );
+        }
+        ioreq->ios2_DataLength = nfields * 4;
+        break;
+    }
+
+    case VN_DBG_FIRE_IRQ: {
+        /* Force one ISR fire via ICS. Only meaningful when we're ONLINE
+         * (IMS unmask must have already happened) — otherwise ICR bits
+         * set here are just masked and never delivered. Used by testirq
+         * to verify the IRQ path end-to-end after state transitions. */
+        if (devBase->state != LO_STATE_ONLINE || !devBase->bar0) {
+            ioreq->ios2_Req.io_Error = S2ERR_BAD_STATE;
+            ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
+            break;
+        }
+        volatile void *mmio = (volatile void *)devBase->bar0->BaseAddress;
+        e1000_write32(mmio, E1000_REG_ICS, E1000_INTR_LSC);
+        /* Return the (probably updated) counter for convenience. */
+        ioreq->ios2_DataLength = devBase->irq_counter;
+        break;
+    }
+
+    case S2_CONFIGINTERFACE: {
+        /* SANA-II-NOTES §3.3: caller sets ios2_SrcAddr = MAC to program;
+         * all-zeros means "use factory". */
+        /* Phase 7a diagnostic: snapshot the WHOLE ioreq before we
+         * write anything, so DBG_CFGBUF can dump every field. Roadshow
+         * might set some non-obvious field that steers post-CONFIG
+         * pool sizing. */
+        devBase->config_call_count++;
+        {
+            volatile UBYTE *src = (volatile UBYTE *)ioreq;
+            volatile UBYTE *dst = devBase->config_before;
+            for (int i = 0; i < 80; i++) dst[i] = src[i];
+        }
+
+        BOOL want_factory = TRUE;
+        for (int i = 0; i < 6; i++)
+            if (ioreq->ios2_SrcAddr[i] != 0) { want_factory = FALSE; break; }
+
+        if (devBase->state != LO_STATE_OFFLINE) {
+            /* Second (or later) config call — accept as no-op IF caller
+             * wants factory MAC (or the same MAC we already have). Refuse
+             * only actual MAC changes while online / already-configured. */
+            if (!want_factory) {
+                BOOL same_mac = TRUE;
+                for (int i = 0; i < 6; i++)
+                    if (ioreq->ios2_SrcAddr[i] != devBase->mac[i]) {
+                        same_mac = FALSE; break;
+                    }
+                if (!same_mac) {
+                    ioreq->ios2_Req.io_Error = S2ERR_BAD_STATE;
+                    ioreq->ios2_WireError    = S2WERR_IS_CONFIGURED;
+                    break;
+                }
+            }
+            /* Phase 7a: MUST write ios2_SrcAddr = station MAC on the
+             * reply. Roadshow's DEBUG=YES output "hardware address =
+             * 00:00:00:00:00:00" proved that Roadshow reads SrcAddr
+             * from CONFIGINTERFACE reply and stores it as the
+             * interface MAC. Not writing left zero → Roadshow
+             * couldn't build valid Ethernet headers.
+             *
+             * pa6t_eth "works" without this because pa6t queues
+             * CONFIGINTERFACE to a task and only sets io_Error/
+             * WireError; but pa6t's Roadshow-side interface config
+             * has DHCP=YES, and the DHCP client separately calls
+             * S2_GETSTATIONADDRESS. Our static-IP flow may not. */
+            for (int i = 0; i < 6; i++) {
+                ioreq->ios2_SrcAddr[i] = devBase->mac[i];
+                ioreq->ios2_DstAddr[i] = 0xFF;
+            }
+            /* Phase 7a diagnostic AFTER snapshot (idempotent path). */
+            {
+                volatile UBYTE *src = (volatile UBYTE *)ioreq;
+                volatile UBYTE *dst = devBase->config_after;
+                for (int i = 0; i < 80; i++) dst[i] = src[i];
+            }
+            break;
+        }
+        if (!want_factory) {
+            /* TODO Phase 6b: program RAL/RAH from ios2_SrcAddr. For now
+             * we accept the request and refuse to bounce the factory MAC,
+             * so callers can pass their own address without an error but
+             * the physical MAC on the wire won't actually change until we
+             * wire the write. */
+        }
+        /* Phase 8d: auto-online re-enabled now that S2_SANA2HOOK is
+         * handled — Roadshow's Copy* invocations go through a real
+         * Hook+SANA2CopyHookMsg, so RX/TX delivery should be safe. */
+        vn_online_hw(devBase);
+        devBase->state = LO_STATE_ONLINE;
+        vn_signal_event(devBase, S2EVENT_ONLINE);
+#if 0
+        devBase->state = LO_STATE_CONFIGURED;
+        /* PHASE 7o GDB SESSION FINDING: found interpreter function
+         * entry at 0x018559b0 (takes r3=input-ptr, r4=obj-with-tables).
+         *   r5 = *(r4+0)     — state table base
+         *   r30 = *(r4+8)    — some pointer
+         *   r28 = *(r4+0x14) — handler table base
+         *   r8 = r3 (initial input pointer) then walks the bytecode
+         *
+         * Interpreter loop body (0x01855a0c onwards) reads halfword
+         * tokens, indexes state table, dispatches handlers, uses
+         * coroutine-style pattern (r22->0x1c saves/restores stack).
+         * Later code (0x01855aa4-e4) makes a system call at address
+         * 0x018138ec via `sc` instruction.
+         *
+         * Preceding sibling functions at 0x01855900, 0x01855944:
+         * virtual dispatch via r->0x2e8 (a vtable offset) — classic
+         * OO pattern.
+         *
+         * NOT identified yet: what library this is (unusual VMA of
+         * 0x0185xxxx is beyond bsdsocket .text end 0x01054414, so
+         * likely a different library relocated high). Candidates
+         * based on the pattern:
+         *   - dos.library MatchPattern (bytecode wildcard matcher)
+         *   - rexxsyslib.library (ARexx interpreter)
+         *   - Roadshow's own IP config expression parser
+         *
+         * The 0x018559b0 function's caller (via bl or bctrl) would
+         * reveal the context. Search log for LR value 0x018559b4 to
+         * find who calls in. Or set gdb.sh break *0x018559b0 and
+         * dump r3/r4 on hit — that tells us the input stream + object.
+         */
+#if 0
+        /* PHASE 7n GDB SESSION FINDING: caught real disassembly at
+         * 0x01855a0c via QEMU monitor `x/16i 0x01855a0c`. Code is a
+         * bytecode/DFA interpreter loop:
+         *   0x01855a0c: lhz  r9, 0(r8)         load 2-byte token @ r8
+         *   0x01855a10: slwi r0, r9, 2         * 4 (state table index)
+         *   0x01855a14: addi r21, r8, 2        advance stream by 2
+         *   0x01855a18: lwzx r10, r5, r0       load state entry
+         *   0x01855a1c-24: rlwinm bitfield extracts from r10
+         *   0x01855a28: lwzx r25, r28, r26     look up handler
+         *   0x01855a2c: add  r8, r21, r11      advance stream (r11 = variable len)
+         *   0x01855a30: mtctr r25; bctrl        dispatch to handler
+         *
+         * DEAR from a live guru: 0x6fd42d7c — a heap-region address.
+         * The interpreter walks r8 through a bytecode stream. When
+         * r8 walks off the end into unmapped heap, the lhz faults.
+         *
+         * NEXT: identify what BYTECODE stream this is parsing, and
+         * where r8 initially points. Likely a Roadshow-internal
+         * parser (regex/DFA for something — DNS names? config? IP
+         * expression?) invoked once state=ONLINE lets it run. */
+#endif
+#endif
+        /* Phase 7a: Roadshow's DEBUG=YES output proved that Roadshow
+         * reads ios2_SrcAddr from CONFIGINTERFACE reply as the
+         * interface hardware address. Must set it here. Also fill
+         * DstAddr with broadcast per SANA-II §3.3. */
+        for (int i = 0; i < 6; i++) {
+            ioreq->ios2_SrcAddr[i] = devBase->mac[i];
+            ioreq->ios2_DstAddr[i] = 0xFF;
+        }
+        /* Phase 7a diagnostic AFTER snapshot. */
+        {
+            volatile UBYTE *src = (volatile UBYTE *)ioreq;
+            volatile UBYTE *dst = devBase->config_after;
+            for (int i = 0; i < 80; i++) dst[i] = src[i];
+        }
+        break;
+    }
+
+    case S2_ONLINE: {
+        /* SANA-II-NOTES §3.4: requires CONFIGURED. On success enables
+         * RX/TX and unmasks IRQs, transitions state to ONLINE. */
+        if (devBase->state == LO_STATE_ONLINE) break;   /* idempotent */
+        if (devBase->state != LO_STATE_CONFIGURED) {
+            ioreq->ios2_Req.io_Error = S2ERR_BAD_STATE;
+            ioreq->ios2_WireError    = S2WERR_NOT_CONFIGURED;
+            break;
+        }
+        vn_online_hw(devBase);
+        devBase->state = LO_STATE_ONLINE;
+        vn_signal_event(devBase, S2EVENT_ONLINE);
+        break;
+    }
+
+    case S2_OFFLINE: {
+        /* SANA-II-NOTES §3.5: always succeeds. Disables hardware and
+         * demotes to CONFIGURED (config retained; caller can S2_ONLINE
+         * again without re-configuring). */
+        if (devBase->state == LO_STATE_ONLINE) {
+            vn_offline_hw(devBase);
+            devBase->state = LO_STATE_CONFIGURED;
+        }
+        /* Phase 7a: reply any queued S2_ONEVENT requests waiting for
+         * S2EVENT_OFFLINE. */
+        vn_signal_event(devBase, S2EVENT_OFFLINE);
+        break;
+    }
+
+    case VN_DBG_SEND:
+    case CMD_WRITE:
+    case S2_BROADCAST: {
+        /* Software loopback: deliver payload to every OTHER opener's
+         * queued CMD_READ. No hardware, no ring, no DMA. */
+        if (devBase->state != LO_STATE_ONLINE) {
+            ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+            ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
+            break;
+        }
+        ULONG plen = ioreq->ios2_DataLength;
+        if (plen == 0 || plen > 1514) {
+            ioreq->ios2_Req.io_Error = S2ERR_MTU_EXCEEDED;
+            ioreq->ios2_WireError    = S2WERR_GENERIC_ERROR;
+            break;
+        }
+
+        struct LoOpener *tx_op = NULL;
+        if (ioreq->ios2_BufferManagement) {
+            IExec->ObtainSemaphore(&devBase->opener_lock);
+            tx_op = vn_find_opener(devBase, ioreq->ios2_BufferManagement);
+            IExec->ReleaseSemaphore(&devBase->opener_lock);
+        }
+
+        /* Cook payload into local frame (skip 14-byte header). */
+        UBYTE frame[1600];
+        BOOL cooked = (tx_op != NULL) && (devBase->IUtility != NULL) &&
+                      (tx_op->sana2_hook != NULL || tx_op->copy_from_buff != NULL);
+        if (cooked) {
+            if (!vn_invoke_copy_from(devBase, tx_op, ioreq, frame, plen)) {
+                ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+                ioreq->ios2_WireError    = S2WERR_BUFF_ERROR;
+                break;
+            }
+        } else {
+            UBYTE *src = (UBYTE *)ioreq->ios2_Data;
+            for (ULONG i = 0; i < plen; i++) frame[i] = src[i];
+        }
+
+        UWORD ptype = ioreq->ios2_PacketType;
+        UBYTE dst_mac[6], src_mac[6];
+        for (int i = 0; i < 6; i++) {
+            dst_mac[i] = ioreq->ios2_DstAddr[i];
+            src_mac[i] = devBase->mac[i];
+        }
+
+        /* Deliver to every opener with a queued CMD_READ, INCLUDING
+         * the sender — Linux lo0 semantics. Ping-to-self requires the
+         * sender's own RX queue to receive the frame back. */
+        ULONG delivered = 0;
+        (void)tx_op;
+        IExec->ObtainSemaphore(&devBase->opener_lock);
+        struct LoOpener *rx_op;
+        for (rx_op = (struct LoOpener *)devBase->opener_list.mlh_Head;
+             rx_op->node.mln_Succ;
+             rx_op = (struct LoOpener *)rx_op->node.mln_Succ) {
+            struct IOSana2Req *rx_req = (struct IOSana2Req *)
+                IExec->RemHead((struct List *)&rx_op->read_queue);
+            if (!rx_req) continue;
+
+            rx_req->ios2_DataLength = plen;
+            rx_req->ios2_PacketType = ptype;
+            for (int i = 0; i < 6; i++) {
+                rx_req->ios2_SrcAddr[i] = src_mac[i];
+                rx_req->ios2_DstAddr[i] = dst_mac[i];
+            }
+            BOOL rx_cooked = (devBase->IUtility != NULL) &&
+                             (rx_op->sana2_hook != NULL || rx_op->copy_to_buff != NULL);
+            if (rx_cooked) {
+                vn_invoke_copy_to(devBase, rx_op, rx_req, frame, plen);
+            } else {
+                UBYTE *dst = (UBYTE *)rx_req->ios2_Data;
+                for (ULONG i = 0; i < plen; i++) dst[i] = frame[i];
+            }
+            rx_req->ios2_Req.io_Error = 0;
+            rx_req->ios2_WireError    = 0;
+            rx_req->ios2_Req.io_Message.mn_Node.ln_Type = NT_REPLYMSG;
+            IExec->ReplyMsg((struct Message *)rx_req);
+            delivered++;
+        }
+        IExec->ReleaseSemaphore(&devBase->opener_lock);
+
+        devBase->prof_tx_calls++;
+        (void)delivered;   /* could track drops-no-reader here */
+        break;
+    }
+
+    case S2_READORPHAN:
+        /* Frames not claimed by any type-tracked opener. We don't do
+         * per-type filtering, so orphan reads are structurally
+         * identical to CMD_READ — fall through. */
+        /* fallthrough */
+    case CMD_READ: {
+        /* PHASE 7j RESULT: immediate-success reply (io_Error=0,
+         * DataLength=0) ALSO gurus. So the trigger is not "holding
+         * the request forever" — it's ANY successful CMD_READ reply.
+         * Roadshow's post-CMD_READ codepath is unconditionally buggy
+         * at 0x01855a0c when reached. Stayed with reject-while-not-
+         * ONLINE. */
+        if (devBase->state != LO_STATE_ONLINE) {
+            ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+            ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
+            break;
+        }
+        struct LoOpener *op = NULL;
+        if (ioreq->ios2_BufferManagement) {
+            IExec->ObtainSemaphore(&devBase->opener_lock);
+            op = vn_find_opener(devBase, ioreq->ios2_BufferManagement);
+        } else {
+            IExec->ObtainSemaphore(&devBase->opener_lock);
+        }
+        if (!op) {
+            IExec->ReleaseSemaphore(&devBase->opener_lock);
+            ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
+            ioreq->ios2_WireError    = S2WERR_GENERIC_ERROR;
+            break;
+        }
+        IExec->AddTail((struct List *)&op->read_queue,
+                       (struct Node *)&ioreq->ios2_Req.io_Message.mn_Node);
+        IExec->ReleaseSemaphore(&devBase->opener_lock);
+
+        /* Clear IOF_QUICK so the caller's WaitIO actually waits for the
+         * reply. Also — since we did NOT set io_Error and are NOT
+         * ReplyMsg'ing here, return early to skip the tail ReplyMsg. */
+        ioreq->ios2_Req.io_Flags &= ~IOF_QUICK;
+        return;
+    }
+
+    case S2_GETSTATIONADDRESS: {
+        /* SANA-II-NOTES §3.2: write factory MAC into ios2_SrcAddr and
+         * currently-configured MAC into ios2_DstAddr. Until Phase 6 wires
+         * S2_CONFIGINTERFACE (which lets a caller override the MAC), both
+         * addresses are the factory value we cached from RAL/RAH. */
+        if (!devBase->hw_present) {
+            ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+            ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
+            break;
+        }
+        for (int i = 0; i < 6; i++) {
+            ioreq->ios2_SrcAddr[i] = devBase->mac[i];
+            ioreq->ios2_DstAddr[i] = devBase->mac[i];
+        }
+        break;
+    }
+
+    /* Phase 7a: Roadshow-required no-op handlers. Advertising these in
+     * vn_supported_cmds without a handler makes Roadshow's DHCP fail
+     * with "broadcast access not supported". Returning success (0) is
+     * fine because our RCTL already accepts broadcast (BAM) and all
+     * multicast (MPE), so subscription requests are effectively already
+     * honored at the HW level — no per-address filter table to update. */
+    case S2_ADDMULTICASTADDRESS:
+    case S2_DELMULTICASTADDRESS:
+    case S2_ADDMULTICASTADDRESSES:
+    case S2_DELMULTICASTADDRESSES:
+        /* Success. HW is already accepting broadcast + all multicast. */
+        break;
+
+    case S2_TRACKTYPE:
+    case S2_UNTRACKTYPE:
+        /* Optional per-ethertype packet-count tracking. We don't keep
+         * per-type counters yet; report success so Roadshow (which
+         * tracks 0x0800/0x0806/0x86DD at bind time) proceeds. */
+        break;
+
+    case S2_SANA2HOOK: {
+        /* Phase 8d: install Roadshow's per-opener Sana2Hook. Per
+         * rolsen/amy_skeletons pattern and SANA-II Rev 7:
+         *   - Caller passes struct Sana2Hook* in ios2_Data
+         *   - ios2_DataLength >= 20 (min hook + methods list header)
+         *   - Sana2Hook has embedded struct Hook + Tag* s2h_Methods
+         *     (array of tag IDs the hook services, terminated with
+         *      TAG_END = 0)
+         * We store the &s2h_Hook (pointer to embedded Hook) in
+         * op->sana2_hook. Copy invocation via CallHookPkt is done in
+         * vn_invoke_copy_to/from. */
+        struct Sana2Hook *hook = (struct Sana2Hook *)ioreq->ios2_Data;
+        if (!hook) hook = (struct Sana2Hook *)ioreq->ios2_StatData;
+        if (!hook) {
+            ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
+            ioreq->ios2_WireError    = S2WERR_NULL_POINTER;
+            break;
+        }
+        if (ioreq->ios2_DataLength && ioreq->ios2_DataLength < 20) {
+            ioreq->ios2_Req.io_Error = IOERR_BADLENGTH;
+            ioreq->ios2_WireError    = 0;
+            break;
+        }
+        struct LoOpener *op = NULL;
+        if (ioreq->ios2_BufferManagement) {
+            IExec->ObtainSemaphore(&devBase->opener_lock);
+            op = vn_find_opener(devBase, ioreq->ios2_BufferManagement);
+            IExec->ReleaseSemaphore(&devBase->opener_lock);
+        }
+        if (!op) {
+            /* No opener yet — spec permits SANA2HOOK before Open in
+             * some flows, but we can't associate anything. Fail with
+             * a clean error so Roadshow falls back to tag-list. */
+            ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+            ioreq->ios2_WireError    = S2WERR_GENERIC_ERROR;
+            break;
+        }
+        op->sana2_hook         = &hook->s2h_Hook;
+        op->sana2_hook_methods = (ULONG *)hook->s2h_Methods;
+        /* Success — Roadshow will now use this hook for Copy*Buff. */
+        break;
+    }
+
+    case S2_ONEVENT: {
+        /* SANA-II event notification. Real drivers (pa6t_eth, etc.)
+         * QUEUE the request and reply when a matching event fires
+         * via vn_signal_event() below. Roadshow subscribes to
+         * S2EVENT_ONLINE at bind time and expects that request to
+         * stay pending until CONFIGINTERFACE / ONLINE actually
+         * brings the interface online - our earlier reply-immediately
+         * pattern likely broke Roadshow's post-bind alloc.
+         *
+         * Two cases:
+         *   1. The event mask matches CURRENT state -> reply now
+         *      (Roadshow calls S2_ONEVENT AFTER ONLINE; matches
+         *      immediately; no need to queue).
+         *   2. Otherwise -> queue on opener's event_queue; wait for
+         *      state transition to fire vn_signal_event(). */
+        ULONG mask = ioreq->ios2_WireError;
+        ULONG match = 0;
+        if ((mask & S2EVENT_ONLINE)  && devBase->state == LO_STATE_ONLINE)   match |= S2EVENT_ONLINE;
+        if ((mask & S2EVENT_OFFLINE) && devBase->state != LO_STATE_ONLINE)   match |= S2EVENT_OFFLINE;
+        if (match) {
+            ioreq->ios2_WireError = match;
+            break;   /* reply immediately with the matched mask */
+        }
+        /* No match yet — queue this request. Requires an opener to
+         * enqueue on. Fall back to immediate-reply if we can't find
+         * an opener (defensive). */
+        struct LoOpener *op = NULL;
+        if (ioreq->ios2_BufferManagement) {
+            IExec->ObtainSemaphore(&devBase->opener_lock);
+            op = vn_find_opener(devBase, ioreq->ios2_BufferManagement);
+        } else {
+            IExec->ObtainSemaphore(&devBase->opener_lock);
+        }
+        if (op) {
+            ioreq->ios2_Req.io_Flags &= ~IOF_QUICK;
+            ioreq->ios2_Req.io_Message.mn_Node.ln_Type = NT_MESSAGE;
+            IExec->AddTail((struct List *)&op->event_queue,
+                           (struct Node *)&ioreq->ios2_Req.io_Message.mn_Node);
+            IExec->ReleaseSemaphore(&devBase->opener_lock);
+            return;   /* pending — no ReplyMsg */
+        }
+        IExec->ReleaseSemaphore(&devBase->opener_lock);
+        /* No opener — reply with empty mask, io_Error=0. */
+        ioreq->ios2_WireError = 0;
+        break;
+    }
+
+    case S2_GETGLOBALSTATS: {
+        /* Fill Sana2DeviceStats with zeros — we don't yet maintain
+         * per-driver counters. Roadshow uses this for stats display
+         * only; returning zeros is safer than IOERR_NOCMD. */
+        struct Sana2DeviceStats *st = (struct Sana2DeviceStats *)ioreq->ios2_StatData;
+        if (!st) st = (struct Sana2DeviceStats *)ioreq->ios2_Data;
+        if (st) {
+            /* volatile stops GCC optimizing the loop into memset() —
+             * memset would pull newlib into a resident driver and fail
+             * to link. Same trick as the TX zero-pad in CMD_WRITE. */
+            volatile UBYTE *p = (volatile UBYTE *)st;
+            for (ULONG i = 0; i < sizeof(struct Sana2DeviceStats); i++) p[i] = 0;
+        }
         break;
     }
 
     default:
+        /* Every other command still stubs to NOCMD — Phase 4+ will wire
+         * them in one by one, following the same fail-soft pattern. */
         ioreq->ios2_Req.io_Error = IOERR_NOCMD;
         break;
     }
 
-    if (will_reply) {
-        ioreq->ios2_Req.io_Flags &= ~IOF_QUICK;
-        IExec->ReplyMsg((struct Message *)ioreq);
+    /* Phase 7a: log this BeginIO invocation into the cmdlog ring so
+     * DBG_CMDLOG can dump what Roadshow does. Skip if this is the
+     * DBG_CMDLOG or DBG_STATUS call itself — those spam the log. */
+    if (ioreq->ios2_Req.io_Command != VN_DBG_CMDLOG
+        && ioreq->ios2_Req.io_Command != VN_DBG_STATUS
+        && ioreq->ios2_Req.io_Command != VN_DBG_DUMPTX) {
+        ULONG i = devBase->cmdlog_head & 31;
+        devBase->cmdlog[i].cmd         = ioreq->ios2_Req.io_Command;
+        devBase->cmdlog[i].flags_in    = ioreq->ios2_Req.io_Flags;
+        devBase->cmdlog[i].ioerr       = ioreq->ios2_Req.io_Error;
+        devBase->cmdlog[i].wire        = ioreq->ios2_WireError;
+        devBase->cmdlog[i].data_in     = (ULONG)ioreq->ios2_Data;
+        devBase->cmdlog[i].bm_in       = (ULONG)ioreq->ios2_BufferManagement;
+        devBase->cmdlog[i].ptype_in    = (UWORD)ioreq->ios2_PacketType;
+        devBase->cmdlog[i].datalen_out = ioreq->ios2_DataLength;
+        for (int b = 0; b < 6; b++) {
+            devBase->cmdlog[i].src_out[b] = ioreq->ios2_SrcAddr[b];
+            devBase->cmdlog[i].dst_out[b] = ioreq->ios2_DstAddr[b];
+        }
+        devBase->cmdlog_head++;
     }
+
+    /* Phase 8 finding: disabling ReplyMsg here did NOT stop the DSI
+     * @ 0x01855a0c triggered by ping. The crash still fires in
+     * loopback-unit task even with all four kill-switches active
+     * (copy hooks bypassed, RX disabled, S2_ONLINE rejected, and
+     * ReplyMsg elided). So the crash vector is NOT ReplyMsg's
+     * PA_SOFTINT-triggered handler. Investigation must resume with
+     * a different hypothesis:
+     *   - Roadshow may be Cause()-ing a SoftInt that lands in our
+     *     task context regardless of which task's Cause was fired
+     *     (softints run in a "borrowed" task per OS4 semantics)
+     *   - Or our task struct's ln_Name is being reported for a fault
+     *     that actually occurred in another task (e.g., Roadshow's
+     *     bsdsocket daemon)
+     *   - Or something in our BeginIO PutMsg to begin_port has a
+     *     side-effect that runs Roadshow code (unlikely for a
+     *     PA_SIGNAL port).
+     * For now — keep ReplyMsg, keep the counters. */
+    devBase->replymsg_skips++;   /* now a "replies done" counter */
+    devBase->last_skipped_cmd = ioreq->ios2_Req.io_Command;
+    TRACEF(devBase, "REPLY   cmd=%u ioerr=%d wire=0x%08lx\n",
+        (unsigned)ioreq->ios2_Req.io_Command,
+        (int)ioreq->ios2_Req.io_Error,
+        (unsigned long)ioreq->ios2_WireError);
+    IExec->ReplyMsg((struct Message *)ioreq);
+    TRACEF(devBase, "REPLYED cmd=%u (returned from ReplyMsg)\n",
+        (unsigned)ioreq->ios2_Req.io_Command);
+}
+
+LONG _manager_AbortIO(struct DeviceManagerInterface *Self, struct IOSana2Req *ioreq)
+{
+    /* Phase 6l: honest AbortIO. Walk every opener's read_queue looking
+     * for this request; if found, unlink and reply with IOERR_ABORTED.
+     * Without this, a caller who SendIO's CMD_READ then AbortIO's it
+     * (because timeout / user cancel / test cleanup) will have their
+     * WaitIO block forever — the request never gets ReplyMsg'd. */
+    struct LoopbackBase *base = (struct LoopbackBase *)Self->Data.LibBase;
+    struct ExecIFace *IExec = base->IExec;
+    struct LoOpener *op;
+    struct MinNode *node, *next;
+    BOOL found = FALSE;
+
+    IExec->ObtainSemaphore(&base->opener_lock);
+    for (op = (struct LoOpener *)base->opener_list.mlh_Head;
+         op->node.mln_Succ && !found;
+         op = (struct LoOpener *)op->node.mln_Succ) {
+        /* Check read_queue first. */
+        for (node = op->read_queue.mlh_Head;
+             (next = node->mln_Succ) != NULL;
+             node = next) {
+            if ((APTR)node == (APTR)&ioreq->ios2_Req.io_Message.mn_Node) {
+                IExec->Remove((struct Node *)node);
+                found = TRUE;
+                break;
+            }
+        }
+        if (found) break;
+        /* Then event_queue (Phase 7a: S2_ONEVENT is queued). */
+        for (node = op->event_queue.mlh_Head;
+             (next = node->mln_Succ) != NULL;
+             node = next) {
+            if ((APTR)node == (APTR)&ioreq->ios2_Req.io_Message.mn_Node) {
+                IExec->Remove((struct Node *)node);
+                found = TRUE;
+                break;
+            }
+        }
+    }
+    IExec->ReleaseSemaphore(&base->opener_lock);
+
+    if (!found) return IOERR_NOCMD;   /* not on any queue */
+    ioreq->ios2_Req.io_Error = IOERR_ABORTED;
+    IExec->ReplyMsg((struct Message *)ioreq);
+    return 0;
 }

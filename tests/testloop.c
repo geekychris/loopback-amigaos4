@@ -49,37 +49,59 @@ int main(int argc, char **argv)
     g_hook.h_Entry = (uint32(*)())my_copy_hook;
     g_hook.h_SubEntry = NULL; g_hook.h_Data = NULL;
 
-    struct TagItem tags[] = {
+    /* IMPORTANT: each opener needs its OWN BufferManagement pointer.
+     * The driver uses this pointer as the opener's identity for
+     * dispatching CMD_READ/WRITE. If two openers share the pointer,
+     * lookups collide on the first-added opener. Roadshow naturally
+     * hands each interface a distinct tag list. */
+    static struct TagItem tagsA[] = {
         { S2_CopyToBuff,   (uint32)&g_hook },
         { S2_CopyFromBuff, (uint32)&g_hook },
         { TAG_END,         0 },
     };
-    rA->ios2_BufferManagement = (APTR)tags;
-    rB->ios2_BufferManagement = (APTR)tags;
+    static struct TagItem tagsB[] = {
+        { S2_CopyToBuff,   (uint32)&g_hook },
+        { S2_CopyFromBuff, (uint32)&g_hook },
+        { TAG_END,         0 },
+    };
+    rA->ios2_BufferManagement = (APTR)tagsA;
+    rB->ios2_BufferManagement = (APTR)tagsB;
 
     LONG e;
+    IDOS->Printf("step 1: open A\n"); IDOS->FFlush(IDOS->Output());
     e = IExec->OpenDevice("loopback.device", 0, (struct IORequest *)rA, 0);
     if (e) { IDOS->Printf("open A fail %ld\n", (long)e); return 20; }
+    IDOS->Printf("step 2: open B\n"); IDOS->FFlush(IDOS->Output());
     e = IExec->OpenDevice("loopback.device", 0, (struct IORequest *)rB, 0);
     if (e) { IDOS->Printf("open B fail %ld\n", (long)e); return 20; }
 
-    /* Both openers ONLINE. Reuse rA for the online cmd (it changes state
-     * on the whole device, once suffices). */
+    IDOS->Printf("step 3: S2_CONFIGINTERFACE\n"); IDOS->FFlush(IDOS->Output());
     rA->ios2_Req.io_Command = S2_CONFIGINTERFACE;
     for (int i = 0; i < 6; i++) rA->ios2_SrcAddr[i] = 0;
     IExec->DoIO((struct IORequest *)rA);
+    IDOS->Printf("  CONFIGINTERFACE returned: ioerr=%ld wire=0x%lx\n",
+                 (long)rA->ios2_Req.io_Error,
+                 (unsigned long)rA->ios2_WireError);
+    IDOS->FFlush(IDOS->Output());
+    IDOS->Printf("step 4: S2_ONLINE\n"); IDOS->FFlush(IDOS->Output());
     rA->ios2_Req.io_Command = S2_ONLINE;
     IExec->DoIO((struct IORequest *)rA);
+    IDOS->Printf("  ONLINE returned: ioerr=%ld wire=0x%lx\n",
+                 (long)rA->ios2_Req.io_Error,
+                 (unsigned long)rA->ios2_WireError);
+    IDOS->FFlush(IDOS->Output());
 
     /* Opener B queues a CMD_READ with a buffer big enough for our test frame. */
     static UBYTE rx_buf[128];
     for (int i = 0; i < 128; i++) rx_buf[i] = 0;
+    IDOS->Printf("step 5: SendIO CMD_READ on B\n"); IDOS->FFlush(IDOS->Output());
     rB->ios2_Req.io_Command = CMD_READ;
     rB->ios2_Req.io_Error   = 0;
     rB->ios2_Data           = rx_buf;
     rB->ios2_DataLength     = 60;
     rB->ios2_PacketType     = 0x0000;   /* accept any type */
     IExec->SendIO((struct IORequest *)rB);
+    IDOS->Printf("  SendIO returned\n"); IDOS->FFlush(IDOS->Output());
 
     /* Opener A sends a CMD_WRITE with distinctive payload. */
     static UBYTE tx_buf[60];
@@ -90,10 +112,12 @@ int main(int argc, char **argv)
     rA->ios2_PacketType     = 0x0800;
     rA->ios2_Data           = tx_buf;
     rA->ios2_DataLength     = 60;
+    IDOS->Printf("step 6: DoIO CMD_WRITE on A\n"); IDOS->FFlush(IDOS->Output());
     LONG rc = IExec->DoIO((struct IORequest *)rA);
     IDOS->Printf("CMD_WRITE rc=%ld ioerr=%ld wire=0x%lx\n",
                  (long)rc, (long)rA->ios2_Req.io_Error,
                  (unsigned long)rA->ios2_WireError);
+    IDOS->FFlush(IDOS->Output());
 
     /* Now B's CMD_READ should be replied. Wait for it. */
     ULONG got = IExec->Wait((1UL << pB->mp_SigBit) | SIGBREAKF_CTRL_C);

@@ -21,13 +21,13 @@ BUILD    = build
 DEV      = $(BUILD)/loopback.device
 DEV_DBG  = $(BUILD)/loopback.device.debug
 
-TEST_NAMES = testopen teststat testloop testhello testopen_vt
+TEST_NAMES = testopen teststat testloop testhello testopen_vt testperf
 TESTS      = $(patsubst %,$(BUILD)/%,$(TEST_NAMES))
 
-DEV_SRC  = src/device.c
-DEV_OBJ  = $(BUILD)/device.o
-DEV_OBJ_DBG = $(BUILD)/device.dbg.o
-DEV_HDRS = include/version.h include/loopback.h
+DEV_SRC  = src/device.c src/virtio.c
+DEV_OBJ  = $(BUILD)/device.o $(BUILD)/virtio.o
+DEV_OBJ_DBG = $(BUILD)/device.dbg.o $(BUILD)/virtio.dbg.o
+DEV_HDRS = include/version.h include/loopback.h include/virtio.h
 
 .PHONY: all clean test
 
