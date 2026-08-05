@@ -382,11 +382,18 @@ struct Library *_manager_Init(struct Library *lib, BPTR seglist, struct Interfac
          (CONST_STRPTR)DEVNAME, (LONG)DEVMAJOR, (LONG)DEVMINOR,
          (CONST_STRPTR)__DATE__);
 
-    /* RTF_AUTOINIT + MakeLibrary already sets ln_Type/ln_Name/
-     * lib_Version/lib_IdString from the resident tag. Don't touch
-     * lib_Flags — LIBF_CHANGED would trip exec into calling
-     * SumLibrary before allowing OpenDevice, and we don't
-     * implement the checksum path. */
+    /* Explicitly fill dd_Library fields — matches virtnet.device
+     * which works. LIBF_SUMUSED | LIBF_CHANGED is what virtnet uses;
+     * exec accepts these on OS4 (LIBF_CHANGED just means "please
+     * recompute checksum next time"; SumLibrary is a stub for
+     * modern-interface devices). */
+    base->dev_Base.dd_Library.lib_Node.ln_Type = NT_DEVICE;
+    base->dev_Base.dd_Library.lib_Node.ln_Pri  = 0;
+    base->dev_Base.dd_Library.lib_Node.ln_Name = (STRPTR)DEVNAME;
+    base->dev_Base.dd_Library.lib_Flags        = LIBF_SUMUSED | LIBF_CHANGED;
+    base->dev_Base.dd_Library.lib_Version      = DEVMAJOR;
+    base->dev_Base.dd_Library.lib_Revision     = DEVREVISION;
+    base->dev_Base.dd_Library.lib_IdString     = (STRPTR)DEVVERSIONSTRING;
 
     iexec->InitSemaphore(&base->io_lock);
     iexec->InitSemaphore(&base->opener_lock);
@@ -420,6 +427,13 @@ struct Library *_manager_Init(struct Library *lib, BPTR seglist, struct Interfac
     base->mac[4] = 0x00;
     base->mac[5] = 0x01;
 
+    /* Init tracer — marker for QEMU-monitor grep, and a signal
+     * that Init reached this point. */
+    base->packets_tx = 0xDEADBEEF;
+    base->packets_rx = 0xFEEDFACE;
+    base->bytes_tx   = 0xC0FFEE00;
+    base->bytes_rx   = (ULONG)base;   /* self-address so we can find base */
+
     base->UtilityBase = iexec->OpenLibrary("utility.library", 51);
     if (base->UtilityBase) {
         base->IUtility = (struct UtilityIFace *)iexec->GetInterface(
@@ -428,13 +442,14 @@ struct Library *_manager_Init(struct Library *lib, BPTR seglist, struct Interfac
     LOGF(log, (CONST_STRPTR)"utility: %s\n",
          base->IUtility ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"FAILED");
 
-    /* SKIP task start for debugging — see if OpenDevice works without it */
-    BOOL task_ok = TRUE;  /* was: lo_task_start(base, iexec); */
-    LOGF(log, (CONST_STRPTR)"unit task: %s (SKIPPED for debug)\n",
+    BOOL task_ok = lo_task_start(base, iexec);
+    LOGF(log, (CONST_STRPTR)"unit task: %s\n",
          task_ok ? (CONST_STRPTR)"OK" : (CONST_STRPTR)"FAILED");
     LOGF(log, (CONST_STRPTR)"Init done: state=OFFLINE mac=%02lx:%02lx:%02lx:%02lx:%02lx:%02lx\n",
          (ULONG)base->mac[0], (ULONG)base->mac[1], (ULONG)base->mac[2],
          (ULONG)base->mac[3], (ULONG)base->mac[4], (ULONG)base->mac[5]);
+    LOGF(log, (CONST_STRPTR)"base=%p packets_tx=@%p\n",
+         base, &base->packets_tx);
     lo_log_close(iexec, &log);
 
     return (struct Library *)base;
@@ -480,30 +495,18 @@ struct LoopbackBase *_manager_Open(struct DeviceManagerInterface *Self,
                                      struct IOSana2Req *ioreq,
                                      ULONG unitNum, ULONG flags)
 {
-    (void)Self; (void)ioreq; (void)unitNum; (void)flags;
-    /* ULTRA-MINIMAL Open — literally return NULL and set io_Error.
-     * If OpenDevice returns non-zero to testopen with THIS body,
-     * we know Open is being called and can add complexity back.
-     * If it still hangs, the crash is in exec's OpenDevice logic
-     * BEFORE our Open, and we need to look at Init / resident tag. */
-    struct LoopbackBase *base = (struct LoopbackBase *)Self->Data.LibBase;
-    base->packets_tx = 0xABCDEF01;
-    ioreq->ios2_Req.io_Error = IOERR_OPENFAIL;
-    ioreq->ios2_Req.io_Unit   = (struct Unit *)-1;
-    ioreq->ios2_Req.io_Device = (struct Device *)-1;
-    return NULL;
-}
-
-/* Original Open body — disabled while we debug the load-crash. */
-struct LoopbackBase *_manager_Open_full(struct DeviceManagerInterface *Self,
-                                          struct IOSana2Req *ioreq,
-                                          ULONG unitNum, ULONG flags)
-{
     (void)flags;
     struct LoopbackBase *base = (struct LoopbackBase *)Self->Data.LibBase;
     struct ExecIFace *IExec = base->IExec;
 
+    /* Tracer: proves Open was entered. Readable via LO_DBG_STATUS
+     * (packets_tx slot). Also written from another task via teststat
+     * won't clobber this because BeginIO for DBG cmds is fast-path
+     * synchronous — no interleaving. */
+    base->packets_tx = 0xDEADBEEF;
+
     IExec->ObtainSemaphore(&base->io_lock);
+    base->packets_tx = 0xCAFEBABE;   /* passed ObtainSemaphore */
     base->dev_Base.dd_Library.lib_OpenCnt++;
 
     if (unitNum != 0) {
@@ -522,7 +525,6 @@ struct LoopbackBase *_manager_Open_full(struct DeviceManagerInterface *Self,
     base->lo_unit.unit_OpenCnt++;
     base->dev_Base.dd_Library.lib_Flags &= ~LIBF_DELEXP;
 
-    /* Allocate per-opener state. */
     struct LoOpener *op = (struct LoOpener *)IExec->AllocVecTags(
         sizeof(struct LoOpener),
         AVT_Type,           MEMF_SHARED,
@@ -561,13 +563,14 @@ struct LoopbackBase *_manager_Open_full(struct DeviceManagerInterface *Self,
         IExec->AddTail((struct List *)&base->opener_list, (struct Node *)&op->node);
         IExec->ReleaseSemaphore(&base->opener_lock);
 
-        ioreq->ios2_BufferManagement = (APTR)op;   /* Roadshow expects this */
+        ioreq->ios2_BufferManagement = (APTR)op;
     }
 
     IExec->ReleaseSemaphore(&base->io_lock);
     return base;
 }
 
+/* Original Open body — disabled while we debug the load-crash. */
 BPTR _manager_Close(struct DeviceManagerInterface *Self, struct IOSana2Req *ioreq)
 {
     struct LoopbackBase *base = (struct LoopbackBase *)Self->Data.LibBase;
@@ -601,7 +604,12 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self, struct IOSana2Req *io
         return;
     }
 
-    /* Async — send to unit task. */
+    /* Async — send to unit task. If task didn't come up (begin_port
+     * NULL), dispatch synchronously so we don't PutMsg(NULL, ...). */
+    if (!base->begin_port) {
+        lo_dispatch_ioreq(base, ioreq);
+        return;
+    }
     ioreq->ios2_Req.io_Flags &= ~IOF_QUICK;
     ioreq->ios2_Req.io_Message.mn_Node.ln_Type = NT_MESSAGE;
     IExec->PutMsg(base->begin_port, (struct Message *)ioreq);

@@ -21,7 +21,7 @@ BUILD    = build
 DEV      = $(BUILD)/loopback.device
 DEV_DBG  = $(BUILD)/loopback.device.debug
 
-TEST_NAMES = testopen teststat testloop testhello
+TEST_NAMES = testopen teststat testloop testhello testopen_vt
 TESTS      = $(patsubst %,$(BUILD)/%,$(TEST_NAMES))
 
 DEV_SRC  = src/device.c
