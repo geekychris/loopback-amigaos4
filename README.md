@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Loopback Amigaos4 logo" width="180">
+</p>
+
 # loopback.device — SANA-II software loopback for AmigaOS 4
 
 Pure-software SANA-II network device. Every `CMD_WRITE` is delivered
